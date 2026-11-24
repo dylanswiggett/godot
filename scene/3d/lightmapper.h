@@ -174,6 +174,11 @@ public:
 	virtual void add_area_light(const String &p_name, bool p_static, const Vector3 &p_position, const Vector3 &p_direction, const Color &p_color, float p_energy, float p_indirect_energy, float p_range, float p_attenuation, const Vector3 &p_area_width, const Vector3 &p_area_height, float p_size, float p_shadow_blur, const Rect2 &p_texture_rect, float p_max_mipmap) = 0;
 	virtual void add_area_light_atlas(const Vector2i &p_size, int p_mipmap_count, const PackedByteArray &p_atlas_data) = 0;
 	virtual void add_probe(const Vector3 &p_position) = 0;
+	// One side of a portal (see LightmapPortal): rays going into the front (local -Z) of the
+	// entrance's 1x1 rectangle (in its local X/Y plane, scaled by the transform) continue out of
+	// the exit's front, transformed by p_exit * Transform3D(Basis(Vector3(0, 1, 0), Math::PI)) *
+	// p_entrance.affine_inverse(). Lightmappers that don't support portals ignore them.
+	virtual void add_portal(const Transform3D &p_entrance, const Transform3D &p_exit) {}
 	virtual BakeError bake(BakeQuality p_quality, bool p_use_denoiser, float p_denoiser_strength, int p_denoiser_range, int p_bounces, float p_bounce_indirect_energy, float p_bias, int p_max_texture_size, bool p_bake_sh, bool p_bake_shadowmask, bool p_texture_for_bounces, GenerateProbes p_generate_probes, const Ref<Image> &p_environment_panorama, const Basis &p_environment_transform, BakeStepFunc p_step_function = nullptr, void *p_step_userdata = nullptr, float p_exposure_normalization = 1.0, float p_supersampling_factor = 1.0) = 0;
 
 	virtual int get_bake_texture_count() const = 0;

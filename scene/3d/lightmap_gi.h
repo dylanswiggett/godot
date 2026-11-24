@@ -40,6 +40,8 @@ class Light3D;
 class Mesh;
 class Sky;
 
+class LightmapPortal;
+
 class LightmapGIData : public Resource {
 	GDCLASS(LightmapGIData, Resource);
 	RES_BASE_EXTENSION("lmbake")
@@ -231,7 +233,7 @@ private:
 		Vector<Ref<Material>> overrides;
 	};
 
-	void _find_meshes_and_lights(Node *p_at_node, Vector<MeshesFound> &meshes, Vector<LightsFound> &lights, Vector<Vector3> &probes);
+	void _find_meshes_and_lights(Node *p_at_node, Vector<MeshesFound> &meshes, Vector<LightsFound> &lights, Vector<Vector3> &probes, Vector<LightmapPortal *> &portals);
 
 	void _assign_lightmaps();
 	void _clear_lightmaps();

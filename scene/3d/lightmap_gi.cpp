@@ -40,6 +40,7 @@
 #include "core/object/class_db.h"
 #include "core/object/object.h"
 #include "scene/3d/light_3d.h"
+#include "scene/3d/lightmap_portal.h"
 #include "scene/3d/lightmap_probe.h"
 #include "scene/3d/mesh_instance_3d.h"
 #include "scene/resources/camera_attributes.h"
@@ -396,7 +397,7 @@ LightmapGIData::~LightmapGIData() {
 
 ///////////////////////////
 
-void LightmapGI::_find_meshes_and_lights(Node *p_at_node, Vector<MeshesFound> &meshes, Vector<LightsFound> &lights, Vector<Vector3> &probes) {
+void LightmapGI::_find_meshes_and_lights(Node *p_at_node, Vector<MeshesFound> &meshes, Vector<LightsFound> &lights, Vector<Vector3> &probes, Vector<LightmapPortal *> &portals) {
 	MeshInstance3D *mi = Object::cast_to<MeshInstance3D>(p_at_node);
 	if (mi && mi->get_gi_mode() == GeometryInstance3D::GI_MODE_STATIC && mi->is_visible_in_tree()) {
 		Ref<Mesh> mesh = mi->get_mesh();
@@ -484,13 +485,20 @@ void LightmapGI::_find_meshes_and_lights(Node *p_at_node, Vector<MeshesFound> &m
 		probes.push_back(xf.origin);
 	}
 
+	LightmapPortal *portal = Object::cast_to<LightmapPortal>(p_at_node);
+
+	if (portal && portal->is_visible_in_tree()) {
+		portals.push_back(portal);
+	}
+
 	for (int i = 0; i < p_at_node->get_child_count(); i++) {
 		Node *child = p_at_node->get_child(i);
-		if (!child->get_owner()) {
+		// Portals are used even without an owner (e.g. internal children created by tool scripts).
+		if (!child->get_owner() && !Object::cast_to<LightmapPortal>(child)) {
 			continue; //maybe a helper
 		}
 
-		_find_meshes_and_lights(child, meshes, lights, probes);
+		_find_meshes_and_lights(child, meshes, lights, probes, portals);
 	}
 }
 
@@ -1085,10 +1093,11 @@ LightmapGI::BakeError LightmapGI::bake(Node *p_from_node, String p_image_data_pa
 	Vector<Lightmapper::MeshData> mesh_data;
 	Vector<LightsFound> lights_found;
 	Vector<Vector3> probes_found;
+	Vector<LightmapPortal *> portals_found;
 	AABB bounds;
 	{
 		Vector<MeshesFound> meshes_found;
-		_find_meshes_and_lights(p_from_node ? p_from_node : get_parent(), meshes_found, lights_found, probes_found);
+		_find_meshes_and_lights(p_from_node ? p_from_node : get_parent(), meshes_found, lights_found, probes_found, portals_found);
 
 		if (meshes_found.is_empty()) {
 			return BAKE_ERROR_NO_MESHES;
@@ -1415,6 +1424,14 @@ LightmapGI::BakeError LightmapGI::bake(Node *p_from_node, String p_image_data_pa
 		}
 		for (int i = 0; i < probes_found.size(); i++) {
 			lightmapper->add_probe(probes_found[i]);
+		}
+		// Portals whose linked portal is also in the bake, in this node's space like the rest.
+		for (LightmapPortal *portal : portals_found) {
+			LightmapPortal *linked = portal->get_linked_portal_node();
+			if (linked && portals_found.has(linked)) {
+				Transform3D to_local = get_global_transform().affine_inverse();
+				lightmapper->add_portal(to_local * portal->get_global_transform(), to_local * linked->get_global_transform());
+			}
 		}
 	}
 

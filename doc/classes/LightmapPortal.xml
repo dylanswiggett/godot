@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="LightmapPortal" inherits="Node3D" api_type="core" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../class.xsd">
+	<brief_description>
+		One side of a portal that light passes through when baking a [LightmapGI].
+	</brief_description>
+	<description>
+		A [LightmapPortal] is a rectangle, 1x1 in its local X/Y plane and sized by its transform's scale, whose front faces along its local -Z axis. When baking a [LightmapGI], light going into its front continues out of the front of its [member linked_portal], as if the space in front of this portal continued past the linked one: the transform from this portal's space to the linked portal's space is [code]linked.global_transform * Transform3D(Basis(Vector3.UP, PI)) * global_transform.affine_inverse()[/code]. The back of the rectangle has no effect.
+		Portals are one-directional; link two portals to each other for light to pass both ways. Unlike other nodes found when baking, [LightmapPortal] nodes are used even without an owner (e.g. when created by a tool script as internal children), so they don't need to be saved in the scene.
+	</description>
+	<tutorials>
+	</tutorials>
+	<members>
+		<member name="linked_portal" type="NodePath" setter="set_linked_portal" getter="get_linked_portal" default="NodePath(&quot;&quot;)">
+			The [LightmapPortal] that light going into this portal comes out of. If it doesn't point to another [LightmapPortal], this portal is ignored when baking.
+		</member>
+	</members>
+</class>

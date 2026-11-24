@@ -247,6 +247,7 @@
 #include "scene/3d/label_3d.h"
 #include "scene/3d/light_3d.h"
 #include "scene/3d/lightmap_gi.h"
+#include "scene/3d/lightmap_portal.h"
 #include "scene/3d/lightmap_probe.h"
 #include "scene/3d/limit_angular_velocity_modifier_3d.h"
 #include "scene/3d/look_at_modifier_3d.h"
@@ -660,6 +661,7 @@ void register_scene_types() {
 	GDREGISTER_CLASS(LightmapGI);
 	GDREGISTER_CLASS(LightmapGIData);
 	GDREGISTER_CLASS(LightmapProbe);
+	GDREGISTER_CLASS(LightmapPortal);
 	GDREGISTER_ABSTRACT_CLASS(Lightmapper);
 	GDREGISTER_CLASS(GPUParticles3D);
 	GDREGISTER_ABSTRACT_CLASS(GPUParticlesCollision3D);

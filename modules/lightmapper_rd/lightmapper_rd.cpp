@@ -205,6 +205,13 @@ void LightmapperRD::add_probe(const Vector3 &p_position) {
 	probe_positions.push_back(probe);
 }
 
+void LightmapperRD::add_portal(const Transform3D &p_entrance, const Transform3D &p_exit) {
+	Portal portal;
+	portal.entrance = p_entrance;
+	portal.exit = p_exit;
+	portals.push_back(portal);
+}
+
 void LightmapperRD::_plot_triangle_into_triangle_index_list(int p_size, const Vector3i &p_ofs, const AABB &p_bounds, const Vector3 p_points[3], uint32_t p_triangle_index, LocalVector<TriangleSort> &p_triangles_sort, uint32_t p_grid_size) {
 	int half_size = p_size / 2;
 
@@ -1102,6 +1109,10 @@ LightmapperRD::BakeError LightmapperRD::_denoise(RenderingDevice *p_rd, Ref<RDSh
 }
 
 LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_denoiser, float p_denoiser_strength, int p_denoiser_range, int p_bounces, float p_bounce_indirect_energy, float p_bias, int p_max_texture_size, bool p_bake_sh, bool p_bake_shadowmask, bool p_texture_for_bounces, GenerateProbes p_generate_probes, const Ref<Image> &p_environment_panorama, const Basis &p_environment_transform, BakeStepFunc p_step_function, void *p_bake_userdata, float p_exposure_normalization, float p_supersampling_factor) {
+	if (!portals.is_empty()) {
+		// TODO: trace light through portals.
+		print_line(vformat("LightmapperRD: %d portal(s) found (not traced yet).", portals.size()));
+	}
 	int denoiser = GLOBAL_GET("rendering/lightmapping/denoising/denoiser");
 	String oidn_path = EDITOR_GET("filesystem/tools/oidn/oidn_denoise_path");
 
