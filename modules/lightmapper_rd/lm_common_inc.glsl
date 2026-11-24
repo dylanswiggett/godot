@@ -19,6 +19,11 @@ layout(set = 0, binding = 0) uniform BakeParameters {
 	int shadowmask_light_idx;
 	uint transparency_rays;
 	float supersampling_factor;
+
+	uint portal_count;
+	uint pad_portal0;
+	uint pad_portal1;
+	uint pad_portal2;
 }
 bake_params;
 
@@ -131,6 +136,26 @@ layout(set = 0, binding = 13, std430) restrict readonly buffer ClusterAABBs {
 	ClusterAABB data[];
 }
 cluster_aabbs;
+
+// A portal light passes through (see LightmapPortal): rays going into the entrance's front,
+// through its rectangle, continue out of the exit's front, transformed by `transfer`.
+struct Portal {
+	vec3 center;
+	float half_width;
+	vec3 front;
+	float half_height;
+	vec3 right;
+	uint pad0;
+	vec3 up;
+	uint pad1;
+	mat4 transfer;
+	mat4 inverse_transfer;
+};
+
+layout(set = 0, binding = 14, std430) restrict readonly buffer Portals {
+	Portal data[];
+}
+portals;
 
 // Fragment action constants
 const uint FA_NONE = 0;

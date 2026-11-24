@@ -59,6 +59,24 @@ class LightmapperRD : public Lightmapper {
 		uint32_t shadowmask_light_idx = 0;
 		uint32_t transparency_rays = 0;
 		float supersampling_factor = 0.0f;
+
+		uint32_t portal_count = 0;
+		uint32_t pad[3] = {};
+	};
+
+	// A portal on the GPU (see Portal): the entrance's rectangle (unit axes and half sizes), and
+	// the transforms from its front's space to the exit's and back, column-major.
+	struct PortalData {
+		float center[3] = {};
+		float half_width = 0.0f;
+		float front[3] = {};
+		float half_height = 0.0f;
+		float right[3] = {};
+		uint32_t pad0 = 0;
+		float up[3] = {};
+		uint32_t pad1 = 0;
+		float transfer[16] = {};
+		float inverse_transfer[16] = {};
 	};
 
 	struct MeshInstance {

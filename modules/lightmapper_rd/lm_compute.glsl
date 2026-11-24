@@ -349,6 +349,68 @@ uint trace_ray_any_hit(vec3 p_from, vec3 p_to) {
 	return trace_ray(p_from, p_to, true, distance, normal, triangle, barycentric);
 }
 
+// The first portal (nearest p_from) the segment from p_from to p_to goes into (from in front of
+// its entrance to behind it, through its rectangle), or -1. r_t is how far along the segment.
+int find_portal_crossing(vec3 p_from, vec3 p_to, out float r_t) {
+	int found = -1;
+	r_t = 2.0;
+	for (uint i = 0; i < bake_params.portal_count; i++) {
+		Portal portal = portals.data[i];
+		float before = dot(p_from - portal.center, portal.front);
+		float after = dot(p_to - portal.center, portal.front);
+		if (before < 0.0 || after >= 0.0) {
+			continue;
+		}
+		float t = before / (before - after);
+		if (t >= r_t) {
+			continue;
+		}
+		vec3 hit = mix(p_from, p_to, t) - portal.center;
+		if (abs(dot(hit, portal.right)) <= portal.half_width && abs(dot(hit, portal.up)) <= portal.half_height) {
+			found = int(i);
+			r_t = t;
+		}
+	}
+	return found;
+}
+
+// A shadow ray from p_from to p_to, for light arriving along the path through portal p_portal (or
+// -1 for the direct path), in the space in front of that portal's entrance. The path must go into
+// exactly that portal first (the direct path into none: light from whatever is physically behind
+// a portal doesn't come through it), and then reach the light from the exit unblocked, through no
+// further portals. Otherwise the result is an opaque hit. Hits past the portal count as opaque, so
+// callers never continue from them (their position is in the exit's space).
+uint trace_shadow_ray(vec3 p_from, vec3 p_to, int p_portal, out vec4 r_albedo_alpha, out vec3 r_hit_position) {
+	float t;
+	int crossed = find_portal_crossing(p_from, p_to, t);
+	if (crossed != p_portal) {
+		r_albedo_alpha = vec4(0.0, 0.0, 0.0, 1.0);
+		r_hit_position = p_from;
+		return RAY_FRONT;
+	}
+	if (p_portal < 0) {
+		return trace_ray_closest_hit_triangle_albedo_alpha(p_from, p_to, r_albedo_alpha, r_hit_position);
+	}
+
+	vec3 crossing = mix(p_from, p_to, t);
+	uint ret = trace_ray_closest_hit_triangle_albedo_alpha(p_from, crossing, r_albedo_alpha, r_hit_position);
+	if (ret != RAY_MISS) {
+		return ret;
+	}
+	mat4 transfer = portals.data[p_portal].transfer;
+	vec3 from = (transfer * vec4(crossing, 1.0)).xyz;
+	vec3 to = (transfer * vec4(p_to, 1.0)).xyz;
+	float further_t;
+	if (find_portal_crossing(from, to, further_t) >= 0) {
+		r_albedo_alpha = vec4(0.0, 0.0, 0.0, 1.0);
+		r_hit_position = p_from;
+		return RAY_FRONT;
+	}
+	ret = trace_ray_closest_hit_triangle_albedo_alpha(from, to, r_albedo_alpha, r_hit_position);
+	r_albedo_alpha.a = 1.0;
+	return ret;
+}
+
 // https://www.reedbeta.com/blog/hash-functions-for-gpu-rendering/
 uint hash(uint value) {
 	uint state = value * 747796405u + 2891336453u;
@@ -432,10 +494,14 @@ vec2 get_vogel_disk(float p_i, float p_rotation, float p_sample_count_sqrt) {
 	return vec2(cos(theta), sin(theta)) * r;
 }
 
-void trace_direct_light(vec3 p_position, vec3 p_normal, uint p_light_index, bool p_soft_shadowing, out vec3 r_light, out vec3 r_light_dir, inout uint r_noise, float p_texel_size, out float r_shadow) {
+// Light from light p_light_index arriving at p_position: directly (p_portal = -1), or through
+// portal p_portal, as if from a virtual light (the light carried back through the portal into the
+// space in front of its entrance).
+void trace_direct_light(vec3 p_position, vec3 p_normal, uint p_light_index, int p_portal, bool p_soft_shadowing, out vec3 r_light, out vec3 r_light_dir, inout uint r_noise, float p_texel_size, out float r_shadow) {
 	const float EPSILON = 0.00001;
 
 	r_light = vec3(0.0f);
+	r_light_dir = vec3(0.0f);
 	r_shadow = 0.0f;
 
 	vec3 light_pos;
@@ -445,6 +511,20 @@ void trace_direct_light(vec3 p_position, vec3 p_normal, uint p_light_index, bool
 	vec3 light_texture_color = vec3(1.0);
 	vec3 shadow_dir;
 	Light light_data = lights.data[p_light_index];
+	if (p_portal >= 0) {
+		Portal portal = portals.data[p_portal];
+		if (dot(p_position - portal.center, portal.front) <= 0.0) {
+			return; // Not in front of the entrance, so nothing comes through it.
+		}
+		mat3 to_virtual = mat3(portal.inverse_transfer);
+		light_data.position = (portal.inverse_transfer * vec4(light_data.position, 1.0)).xyz;
+		light_data.direction = normalize(to_virtual * light_data.direction);
+		light_data.area_width.xyz = to_virtual * light_data.area_width.xyz;
+		light_data.area_height.xyz = to_virtual * light_data.area_height.xyz;
+		if (light_data.type == LIGHT_TYPE_DIRECTIONAL ? dot(light_data.direction, portal.front) <= 0.0 : dot(light_data.position - portal.center, portal.front) >= 0.0) {
+			return; // The virtual light isn't behind the entrance.
+		}
+	}
 	if (light_data.type == LIGHT_TYPE_DIRECTIONAL) {
 		vec3 light_vec = light_data.direction;
 		light_pos = p_position - light_vec * length(bake_params.world_size);
@@ -591,7 +671,7 @@ void trace_direct_light(vec3 p_position, vec3 p_normal, uint p_light_index, bool
 						vec4 hit_albedo = vec4(1.0);
 						vec3 hit_position;
 						// Offset the ray origin for AA, offset the light position for soft shadows.
-						uint ret = trace_ray_closest_hit_triangle_albedo_alpha(origin - light_disk_to_point * (bake_params.bias + length(disk_sample)), p_position - light_disk_to_point * dist, hit_albedo, hit_position);
+						uint ret = trace_shadow_ray(origin - light_disk_to_point * (bake_params.bias + length(disk_sample)), p_position - light_disk_to_point * dist, p_portal, hit_albedo, hit_position);
 						if (ret == RAY_MISS) {
 							if (!sample_did_hit) {
 								sample_penumbra = 1.0;
@@ -632,7 +712,7 @@ void trace_direct_light(vec3 p_position, vec3 p_normal, uint p_light_index, bool
 					vec4 hit_albedo = vec4(1.0);
 					vec3 hit_position;
 					// Offset the ray origin for AA, offset the light position for soft shadows.
-					uint ret = trace_ray_closest_hit_triangle_albedo_alpha(origin + light_dir * (bake_params.bias + length(disk_sample)), light_pos, hit_albedo, hit_position);
+					uint ret = trace_shadow_ray(origin + light_dir * (bake_params.bias + length(disk_sample)), light_pos, p_portal, hit_albedo, hit_position);
 					if (ret == RAY_MISS) {
 						if (!sample_did_hit) {
 							sample_penumbra = 1.0;
@@ -672,7 +752,7 @@ void trace_direct_light(vec3 p_position, vec3 p_normal, uint p_light_index, bool
 		for (uint iter = 0; iter < bake_params.transparency_rays; iter++) {
 			vec4 hit_albedo = vec4(1.0);
 			vec3 hit_position;
-			uint ret = trace_ray_closest_hit_triangle_albedo_alpha(p_position + shadow_dir * bake_params.bias, light_pos, hit_albedo, hit_position);
+			uint ret = trace_shadow_ray(p_position + shadow_dir * bake_params.bias, light_pos, p_portal, hit_albedo, hit_position);
 			if (ret == RAY_MISS) {
 				if (!did_hit) {
 					penumbra = 1.0;
@@ -727,10 +807,31 @@ vec3 trace_indirect_light(vec3 p_position, vec3 p_ray_dir, inout uint r_noise, f
 	uint transparency_rays_left = bake_params.transparency_rays;
 	vec3 throughput = vec3(1.0);
 	vec3 light = vec3(0.0);
+	// Limits how many portals a ray goes through (facing portals would loop forever).
+	uint portal_hops_left = 8;
 	for (uint depth = 0; depth < max_depth; depth++) {
 		uint tidx;
 		vec3 barycentric;
-		uint trace_result = trace_ray_closest_hit_triangle(position + ray_dir * bake_params.bias, position + ray_dir * length(bake_params.world_size), tidx, barycentric);
+		vec3 ray_from = position + ray_dir * bake_params.bias;
+		vec3 ray_to = position + ray_dir * length(bake_params.world_size);
+		// Only trace up to a portal: what's behind its entrance isn't on the ray's path.
+		float portal_t;
+		int portal = find_portal_crossing(ray_from, ray_to, portal_t);
+		if (portal >= 0) {
+			ray_to = mix(ray_from, ray_to, portal_t);
+		}
+		uint trace_result = trace_ray_closest_hit_triangle(ray_from, ray_to, tidx, barycentric);
+		if (trace_result == RAY_MISS && portal >= 0) {
+			// Continue out of the portal's exit (not a bounce).
+			if (portal_hops_left == 0) {
+				break;
+			}
+			portal_hops_left -= 1;
+			position = (portals.data[portal].transfer * vec4(ray_to, 1.0)).xyz;
+			ray_dir = normalize(mat3(portals.data[portal].transfer) * ray_dir);
+			depth -= 1;
+			continue;
+		}
 		if (trace_result == RAY_FRONT) {
 			Vertex vert0 = vertices.data[triangles.data[tidx].indices.x];
 			Vertex vert1 = vertices.data[triangles.data[tidx].indices.y];
@@ -752,11 +853,13 @@ vec3 trace_indirect_light(vec3 p_position, vec3 p_ray_dir, inout uint r_noise, f
 			// Trace the lights directly. Significantly more expensive but more accurate in scenarios
 			// where the lightmap texture isn't reliable.
 			for (uint i = 0; i < bake_params.light_count; i++) {
-				vec3 light;
-				vec3 light_dir;
-				float shadow;
-				trace_direct_light(position, normal, i, false, light, light_dir, r_noise, p_texel_size, shadow);
-				direct_light += light * lights.data[i].indirect_energy;
+				for (int via_portal = -1; via_portal < int(bake_params.portal_count); via_portal++) {
+					vec3 light;
+					vec3 light_dir;
+					float shadow;
+					trace_direct_light(position, normal, i, via_portal, false, light, light_dir, r_noise, p_texel_size, shadow);
+					direct_light += light * lights.data[i].indirect_energy;
+				}
 			}
 
 			direct_light *= bake_params.exposure_normalization;
@@ -833,11 +936,13 @@ vec3 trace_indirect_light(vec3 p_position, vec3 p_ray_dir, inout uint r_noise, f
 			// Trace the lights directly. Significantly more expensive but more accurate in scenarios
 			// where the lightmap texture isn't reliable.
 			for (uint i = 0; i < bake_params.light_count; i++) {
-				vec3 light;
-				vec3 light_dir;
-				float shadow;
-				trace_direct_light(position, normal, i, false, light, light_dir, r_noise, p_texel_size, shadow);
-				direct_light += light * lights.data[i].indirect_energy;
+				for (int via_portal = -1; via_portal < int(bake_params.portal_count); via_portal++) {
+					vec3 light;
+					vec3 light_dir;
+					float shadow;
+					trace_direct_light(position, normal, i, via_portal, false, light, light_dir, r_noise, p_texel_size, shadow);
+					direct_light += light * lights.data[i].indirect_energy;
+				}
 			}
 
 			direct_light *= bake_params.exposure_normalization;
@@ -905,13 +1010,18 @@ void main() {
 
 	// Use atlas position and a prime number as the seed.
 	uint noise = random_seed(ivec3(atlas_pos, 43573547));
-	for (uint i = 0; i < bake_params.light_count; i++) {
+	// Each light directly, then through each portal. Light through portals is always baked into the
+	// texture, even from lights that are otherwise real-time: they can't shine through portals at
+	// runtime. The shadowmask is only about the direct path.
+	for (uint light_portal = 0; light_portal < bake_params.light_count * (bake_params.portal_count + 1); light_portal++) {
+		uint i = light_portal / (bake_params.portal_count + 1);
+		int portal = int(light_portal % (bake_params.portal_count + 1)) - 1;
 		vec3 light;
 		vec3 light_dir;
 		float shadow;
-		trace_direct_light(position, normal, i, true, light, light_dir, noise, texel_size_world_space, shadow);
+		trace_direct_light(position, normal, i, portal, true, light, light_dir, noise, texel_size_world_space, shadow);
 
-		if (lights.data[i].static_bake) {
+		if (lights.data[i].static_bake || portal >= 0) {
 			light_for_texture += light;
 
 #ifdef USE_SH_LIGHTMAPS
@@ -952,7 +1062,7 @@ void main() {
 		light_for_bounces += light * lights.data[i].indirect_energy;
 
 #ifdef USE_SHADOWMASK
-		if (lights.data[i].type == LIGHT_TYPE_DIRECTIONAL && i == bake_params.shadowmask_light_idx) {
+		if (lights.data[i].type == LIGHT_TYPE_DIRECTIONAL && i == bake_params.shadowmask_light_idx && portal < 0) {
 			shadowmask_value = max(shadowmask_value, shadow);
 		}
 #endif

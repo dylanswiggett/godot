@@ -1109,10 +1109,6 @@ LightmapperRD::BakeError LightmapperRD::_denoise(RenderingDevice *p_rd, Ref<RDSh
 }
 
 LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_denoiser, float p_denoiser_strength, int p_denoiser_range, int p_bounces, float p_bounce_indirect_energy, float p_bias, int p_max_texture_size, bool p_bake_sh, bool p_bake_shadowmask, bool p_texture_for_bounces, GenerateProbes p_generate_probes, const Ref<Image> &p_environment_panorama, const Basis &p_environment_transform, BakeStepFunc p_step_function, void *p_bake_userdata, float p_exposure_normalization, float p_supersampling_factor) {
-	if (!portals.is_empty()) {
-		// TODO: trace light through portals.
-		print_line(vformat("LightmapperRD: %d portal(s) found (not traced yet).", portals.size()));
-	}
 	int denoiser = GLOBAL_GET("rendering/lightmapping/denoising/denoiser");
 	String oidn_path = EDITOR_GET("filesystem/tools/oidn/oidn_denoise_path");
 
@@ -1364,6 +1360,7 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 	RID grid_texture;
 	RID seams_buffer;
 	RID probe_positions_buffer;
+	RID portals_buffer;
 
 	Vector<int> slice_seam_count;
 
@@ -1377,10 +1374,50 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 	rd->free_rid(cluster_aabbs_buffer); \
 	rd->free_rid(grid_texture); \
 	rd->free_rid(seams_buffer); \
-	rd->free_rid(probe_positions_buffer);
+	rd->free_rid(probe_positions_buffer); \
+	rd->free_rid(portals_buffer);
 
 	const uint32_t cluster_size = 16;
 	_create_acceleration_structures(rd, atlas_size, atlas_slices, bounds, grid_size, cluster_size, probe_positions, p_generate_probes, slice_triangle_count, slice_seam_count, vertex_buffer, triangle_buffer, lights_buffer, triangle_indices_buffer, cluster_indices_buffer, cluster_aabbs_buffer, probe_positions_buffer, grid_texture, seams_buffer, p_step_function, p_bake_userdata);
+
+	// Portals light passes through.
+	{
+		LocalVector<PortalData> portal_data;
+		const Basis half_turn(Vector3(0, 1, 0), Math::PI);
+		for (const Portal &portal : portals) {
+			PortalData data;
+			const Basis &basis = portal.entrance.basis;
+			Vector3 center = portal.entrance.origin;
+			Vector3 front = -basis.get_column(2).normalized();
+			Vector3 right = basis.get_column(0).normalized();
+			Vector3 up = basis.get_column(1).normalized();
+			for (int i = 0; i < 3; i++) {
+				data.center[i] = center[i];
+				data.front[i] = front[i];
+				data.right[i] = right[i];
+				data.up[i] = up[i];
+			}
+			data.half_width = basis.get_column(0).length() / 2.0;
+			data.half_height = basis.get_column(1).length() / 2.0;
+			Transform3D transfer = portal.exit * Transform3D(half_turn) * portal.entrance.affine_inverse();
+			Transform3D inverse = transfer.affine_inverse();
+			for (int c = 0; c < 4; c++) {
+				Vector3 t = c < 3 ? transfer.basis.get_column(c) : transfer.origin;
+				Vector3 it = c < 3 ? inverse.basis.get_column(c) : inverse.origin;
+				for (int r = 0; r < 3; r++) {
+					data.transfer[c * 4 + r] = t[r];
+					data.inverse_transfer[c * 4 + r] = it[r];
+				}
+				data.transfer[c * 4 + 3] = c < 3 ? 0.0 : 1.0;
+				data.inverse_transfer[c * 4 + 3] = c < 3 ? 0.0 : 1.0;
+			}
+			portal_data.push_back(data);
+		}
+		if (portal_data.is_empty()) {
+			portal_data.push_back(PortalData()); // Storage buffers can't be empty.
+		}
+		portals_buffer = rd->storage_buffer_create(portal_data.size() * sizeof(PortalData), portal_data.span().reinterpret<uint8_t>());
+	}
 
 	// The index of the directional light used for shadowmasking.
 	int shadowmask_light_idx = -1;
@@ -1440,6 +1477,7 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 	// Same number of rays for transparency regardless of quality (it's more of a retry rather than shooting new ones).
 	bake_parameters.transparency_rays = GLOBAL_GET("rendering/lightmapping/bake_performance/max_transparency_rays");
 	bake_parameters.supersampling_factor = p_supersampling_factor;
+	bake_parameters.portal_count = portals.size();
 
 	bake_parameters_buffer = rd->uniform_buffer_create(sizeof(BakeParameters));
 	rd->buffer_update(bake_parameters_buffer, 0, sizeof(BakeParameters), &bake_parameters);
@@ -1597,6 +1635,13 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
 			u.binding = 13;
 			u.append_id(cluster_aabbs_buffer);
+			base_uniforms.push_back(u);
+		}
+		{
+			RD::Uniform u;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.binding = 14;
+			u.append_id(portals_buffer);
 			base_uniforms.push_back(u);
 		}
 	}
