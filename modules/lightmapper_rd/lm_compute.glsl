@@ -397,6 +397,33 @@ int find_portal_crossing(vec3 p_from, vec3 p_to, out float r_t) {
 	return found;
 }
 
+// Bounce light for a texel just behind a portal's entrance (within PORTAL_CONTINUATION_TEXELS
+// texels of its plane, within its opening) is sampled where it continues past the portal: its
+// position and normal carried through the portal. The denoiser then averages texels on either side
+// of the opening with samples from the other side, so the denoised bounce light is continuous
+// across it. (Only bounce light, which is always baked: doing this for direct light would mix
+// real-time and baked light across the seam for real-time lights. portal_seams overwrites these
+// texels with values from in front of the opening afterwards, for runtime filtering.)
+const float PORTAL_CONTINUATION_TEXELS = 3.0;
+
+void apply_portal_continuation(inout vec3 r_position, inout vec3 r_normal, float p_texel_spacing) {
+	float depth = PORTAL_CONTINUATION_TEXELS * p_texel_spacing;
+	for (uint i = 0; i < bake_params.portal_count; i++) {
+		Portal portal = portals.data[i];
+		float side = dot(r_position - portal.center, portal.front);
+		if (side >= 0.0 || side < -depth) {
+			continue;
+		}
+		vec3 on_plane = r_position - portal.front * side - portal.center;
+		if (abs(dot(on_plane, portal.right)) > portal.half_width + PORTAL_EDGE_TOLERANCE || abs(dot(on_plane, portal.up)) > portal.half_height + PORTAL_EDGE_TOLERANCE) {
+			continue;
+		}
+		r_position = (portal.transfer * vec4(r_position, 1.0)).xyz;
+		r_normal = normalize(mat3(portal.transfer) * r_normal);
+		return;
+	}
+}
+
 // p_sample (a point near p_position, e.g. an anti-aliasing sample within its texel), moved back onto
 // p_position's side of any portal opening between them, so texels at an opening don't average
 // light from both sides of it.
@@ -840,6 +867,26 @@ void trace_direct_light(vec3 p_position, vec3 p_normal, uint p_light_index, int 
 
 #endif
 
+#ifdef MODE_BOUNCE_LIGHT
+// World-space distance from a texel to its nearest used neighbor (texels in other charts nearby in
+// the atlas are much farther away, so the nearest is on the same surface).
+float texel_spacing(ivec2 p_atlas_pos, vec3 p_position) {
+	float spacing = 1e20;
+	const ivec2 offsets[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+	for (int i = 0; i < 4; i++) {
+		ivec2 p = p_atlas_pos + offsets[i];
+		if (any(lessThan(p, ivec2(0))) || any(greaterThanEqual(p, bake_params.atlas_size))) {
+			continue;
+		}
+		vec4 neighbor = texelFetch(sampler2DArray(source_position, linear_sampler), ivec3(p, params.atlas_slice), 0);
+		if (neighbor.w >= 0.001) {
+			spacing = min(spacing, distance(neighbor.xyz, p_position));
+		}
+	}
+	return spacing < 1e19 ? spacing : 0.0;
+}
+#endif
+
 #if defined(MODE_BOUNCE_LIGHT) || defined(MODE_LIGHT_PROBES)
 
 vec3 trace_environment_color(vec3 ray_dir) {
@@ -1170,6 +1217,7 @@ void main() {
 	int neighbor_offset = atlas_pos.x < bake_params.atlas_size.x - 1 ? 1 : -1;
 	vec3 neighbor_position = texelFetch(sampler2DArray(source_position, linear_sampler), ivec3(atlas_pos + ivec2(neighbor_offset, 0), params.atlas_slice), 0).xyz;
 	float texel_size_world_space = distance(position, neighbor_position);
+	apply_portal_continuation(position, normal, texel_spacing(atlas_pos, position));
 	uint noise = random_seed(ivec3(params.ray_from, atlas_pos));
 	for (uint i = params.ray_from; i < params.ray_to; i++) {
 		vec3 ray_dir = generate_ray_dir_from_normal(normal, noise);
@@ -1538,8 +1586,8 @@ void main() {
 	// front of it: lighting these texels as the place they continue into instead would mix real-time
 	// and baked light within the filter at the edge, for real-time lights.) params.ray_count is the
 	// number of layers per atlas slice (4 for SH lightmaps).
-	const int max_radius = 8;
-	const float max_step_texels = 6.0;
+	const int max_radius = 13;
+	const float max_step_texels = 12.0;
 	// How far behind the plane texels are filled (enough for the filter's reach).
 	const float seam_depth_texels = 3.0;
 	uint layers = params.ray_count;
@@ -1583,40 +1631,56 @@ void main() {
 			}
 
 			// Where to copy from: a point just in front of the plane, reached along the light's
-			// direction on the surface, or straight back.
+			// direction on the surface; or straight back, if there's no such direction or it lands
+			// off the surface (e.g. into a wall at a door's corner).
 			float target_side = 0.5 * texel_size;
 			vec3 along = light_dir - normal * dot(light_dir, normal);
-			vec3 target;
+			vec3 back = portal.front - normal * dot(portal.front, normal);
+			vec3 targets[2];
+			targets[0] = vec3(1e20);
+			targets[1] = length(back) > 0.1 ? position.xyz + normalize(back) * ((target_side - side) / dot(normalize(back), portal.front)) : position.xyz;
 			if (length(along) > 0.1 && abs(dot(normalize(along), portal.front)) > 0.1) {
 				along = normalize(along);
 				along *= sign(dot(along, portal.front));
 				float distance_along = (target_side - side) / dot(along, portal.front);
-				target = distance_along <= max_step_texels * texel_size ? position.xyz + along * distance_along : vec3(1e20);
-			} else {
-				target = vec3(1e20);
-			}
-			if (target.x >= 1e19) {
-				vec3 back = portal.front - normal * dot(portal.front, normal);
-				target = length(back) > 0.1 ? position.xyz + normalize(back) * ((target_side - side) / dot(normalize(back), portal.front)) : position.xyz;
+				if (distance_along <= max_step_texels * texel_size) {
+					targets[0] = position.xyz + along * distance_along;
+				}
 			}
 
-			float max_distance = distance(target, position.xyz) + 2.0 * texel_size;
-			float best = 1e20;
-			for (int y = -max_radius; y <= max_radius; y++) {
-				for (int x = -max_radius; x <= max_radius; x++) {
-					ivec2 p = atlas_pos + ivec2(x, y);
-					if (any(lessThan(p, ivec2(0))) || any(greaterThanEqual(p, atlas_dims))) {
-						continue;
+			for (int t = 0; t < 2 && source_pos == atlas_pos; t++) {
+				vec3 target = targets[t];
+				if (target.x >= 1e19) {
+					continue;
+				}
+				float max_distance = distance(target, position.xyz) + 2.0 * texel_size;
+				float best = 1e20;
+				ivec2 best_pos = atlas_pos;
+				for (int y = -max_radius; y <= max_radius; y++) {
+					for (int x = -max_radius; x <= max_radius; x++) {
+						ivec2 p = atlas_pos + ivec2(x, y);
+						if (any(lessThan(p, ivec2(0))) || any(greaterThanEqual(p, atlas_dims))) {
+							continue;
+						}
+						vec4 n = texelFetch(sampler2DArray(source_position, linear_sampler), ivec3(p, params.atlas_slice), 0);
+						if (n.w < 0.001 || dot(n.xyz - portal.center, portal.front) < 0.0 || distance(n.xyz, position.xyz) > max_distance) {
+							continue;
+						}
+						// Same surface: facing the same way.
+						vec3 n_normal = texelFetch(sampler2DArray(source_normal, linear_sampler), ivec3(p, params.atlas_slice), 0).xyz;
+						if (length(n_normal) < 0.5 || dot(normalize(n_normal), normal) < 0.9) {
+							continue;
+						}
+						float d = distance(n.xyz, target);
+						if (d < best) {
+							best = d;
+							best_pos = p;
+						}
 					}
-					vec4 n = texelFetch(sampler2DArray(source_position, linear_sampler), ivec3(p, params.atlas_slice), 0);
-					if (n.w < 0.001 || dot(n.xyz - portal.center, portal.front) < 0.0 || distance(n.xyz, position.xyz) > max_distance) {
-						continue;
-					}
-					float d = distance(n.xyz, target);
-					if (d < best) {
-						best = d;
-						source_pos = p;
-					}
+				}
+				// Only if the target is on the surface (within about a texel of a texel on it).
+				if (best <= 1.5 * texel_size) {
+					source_pos = best_pos;
 				}
 			}
 		}

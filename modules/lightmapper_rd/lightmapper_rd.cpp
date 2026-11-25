@@ -448,6 +448,39 @@ void LightmapperRD::_create_acceleration_structures(RenderingDevice *rd, Size2i 
 	LocalVector<Vertex> vertex_array;
 	LocalVector<Seam> seams;
 
+	// Seams through portals. Meshes are expected to be cut where they cross a portal's opening (so no
+	// lightmap region spans it). Such cut edges aren't blended with the piece behind the portal's
+	// plane, which is lit as a different place: the piece in front is blended with the matching piece
+	// in front of the other end of the portal instead, which continues it through the portal, so the
+	// baked light meets continuously there.
+	const real_t portal_plane_epsilon = 0.001;
+	const real_t portal_edge_tolerance = 0.01; // PORTAL_EDGE_TOLERANCE in lm_compute.glsl.
+	LocalVector<PortalEdge> portal_edges;
+	// Which portal's opening an edge lies in (both ends on its plane, within the opening), or -1.
+	auto portal_of_edge = [&](const Vector3 &p_a, const Vector3 &p_b) -> int {
+		for (int p = 0; p < portals.size(); p++) {
+			const Transform3D &entrance = portals[p].entrance;
+			Vector3 center = entrance.origin;
+			Vector3 front = -entrance.basis.get_column(2).normalized();
+			Vector3 right = entrance.basis.get_column(0).normalized();
+			Vector3 up = entrance.basis.get_column(1).normalized();
+			real_t half_width = entrance.basis.get_column(0).length() / 2 + portal_edge_tolerance;
+			real_t half_height = entrance.basis.get_column(1).length() / 2 + portal_edge_tolerance;
+			bool inside = true;
+			for (const Vector3 &v : { p_a, p_b }) {
+				Vector3 rel = v - center;
+				if (Math::abs(rel.dot(front)) > portal_plane_epsilon || Math::abs(rel.dot(right)) > half_width || Math::abs(rel.dot(up)) > half_height) {
+					inside = false;
+					break;
+				}
+			}
+			if (inside) {
+				return p;
+			}
+		}
+		return -1;
+	};
+
 	slice_triangle_count.resize(atlas_slices);
 	slice_seam_count.resize(atlas_slices);
 
@@ -524,6 +557,27 @@ void LightmapperRD::_create_acceleration_structures(RenderingDevice *rd, Size2i 
 				if (edge.b == edge.a) {
 					continue; //degenerate, somehow
 				}
+
+				// Edges in a portal's opening are paired through the portal instead (see above):
+				// only from triangles in front of it.
+				int portal = portals.is_empty() ? -1 : portal_of_edge(vtxs[k], vtxs[n]);
+				if (portal >= 0) {
+					const Transform3D &entrance = portals[portal].entrance;
+					Vector3 front = -entrance.basis.get_column(2).normalized();
+					if (front.dot(vtxs[(k + 2) % 3] - entrance.origin) > portal_plane_epsilon) {
+						PortalEdge portal_edge;
+						portal_edge.portal = portal;
+						portal_edge.a = vtxs[k];
+						portal_edge.b = vtxs[n];
+						portal_edge.na = normal[k];
+						portal_edge.nb = normal[n];
+						portal_edge.uva = uvs[k];
+						portal_edge.uvb = uvs[n];
+						portal_edge.slice = mi.slice;
+						portal_edges.push_back(portal_edge);
+					}
+					continue;
+				}
 				if (edge.b < edge.a) {
 					SWAP(edge.a, edge.b);
 					SWAP(edge.na, edge.nb);
@@ -578,6 +632,77 @@ void LightmapperRD::_create_acceleration_structures(RenderingDevice *rd, Size2i 
 		bounds.expand_to(pp);
 	}
 	bounds.grow_by(0.1); //grow a bit to avoid numerical error
+
+	// Pair portal edges: each one, carried through its portal, should lie along edges in front of the
+	// other end facing the same way. The two ends' cuts needn't be segmented alike (their triangles
+	// can differ), so edges are matched by overlap: each overlapping stretch gets seam vertices at its
+	// ends on both sides (interpolated, used only for blending) and is blended as a seam.
+	if (!portal_edges.is_empty()) {
+		const real_t match_tolerance = 0.002;
+		const real_t min_overlap = 0.001;
+		const Basis half_turn(Vector3(0, 1, 0), Math::PI);
+		auto seam_vertex = [&](const PortalEdge &p_edge, real_t p_t) -> uint32_t {
+			Vector3 position = p_edge.a.lerp(p_edge.b, p_t);
+			Vector3 normal = p_edge.na.lerp(p_edge.nb, p_t).normalized();
+			Vector2 uv = p_edge.uva.lerp(p_edge.uvb, p_t);
+			Vertex v;
+			v.position[0] = position.x;
+			v.position[1] = position.y;
+			v.position[2] = position.z;
+			v.uv[0] = uv.x;
+			v.uv[1] = uv.y;
+			v.normal_xy[0] = normal.x;
+			v.normal_xy[1] = normal.y;
+			v.normal_z = normal.z;
+			vertex_array.push_back(v);
+			return vertex_array.size() - 1;
+		};
+		int stretches = 0;
+		real_t paired_length = 0.0, total_length = 0.0;
+		for (const PortalEdge &e : portal_edges) {
+			total_length += e.a.distance_to(e.b);
+			Transform3D transfer = portals[e.portal].exit * Transform3D(half_turn) * portals[e.portal].entrance.affine_inverse();
+			Vector3 ta = transfer.xform(e.a);
+			Vector3 tb = transfer.xform(e.b);
+			Vector3 tn = transfer.basis.orthonormalized().xform((e.na + e.nb).normalized());
+			for (const PortalEdge &o : portal_edges) {
+				// Each pair once (from the portal with the lower index), and within one atlas slice.
+				if (o.portal <= e.portal || o.slice != e.slice) {
+					continue;
+				}
+				Vector3 dir = o.b - o.a;
+				real_t length = dir.length();
+				if (length < min_overlap || tn.dot((o.na + o.nb).normalized()) < 0.99) {
+					continue;
+				}
+				dir /= length;
+				// Both of e's carried-through ends on o's line.
+				real_t ra = (ta - o.a).dot(dir);
+				real_t rb = (tb - o.a).dot(dir);
+				if ((o.a + dir * ra).distance_to(ta) > match_tolerance || (o.a + dir * rb).distance_to(tb) > match_tolerance) {
+					continue;
+				}
+				// The overlap, as positions along o.
+				real_t lo = MAX(MIN(ra, rb), 0.0);
+				real_t hi = MIN(MAX(ra, rb), length);
+				if (hi - lo < min_overlap || Math::is_equal_approx(ra, rb)) {
+					continue;
+				}
+				// Matching points: along o at r, along e at (r - ra) / (rb - ra).
+				real_t e0 = (lo - ra) / (rb - ra), e1 = (hi - ra) / (rb - ra);
+				Seam seam;
+				seam.a = Vector2i(seam_vertex(e, e0), seam_vertex(e, e1));
+				seam.b = Vector2i(seam_vertex(o, lo / length), seam_vertex(o, hi / length));
+				seam.slice = e.slice;
+				seams.push_back(seam);
+				slice_seam_count.write[e.slice]++;
+				stretches++;
+				paired_length += hi - lo;
+			}
+		}
+		// Each paired stretch covers edges at both ends.
+		print_line(vformat("LightmapperRD: portal seams: %.2f m of %.2f m of cut edges paired across portals (%d stretches).", paired_length * 2, total_length, stretches));
+	}
 
 	triangles.sort(); //sort by slice
 	seams.sort();

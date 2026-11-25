@@ -196,6 +196,20 @@ class LightmapperRD : public Lightmapper {
 		EdgeUV2() {}
 	};
 
+	// A mesh edge lying in a portal's opening, on a triangle in front of it (see
+	// _create_acceleration_structures): paired with the matching edge at the other end of the
+	// portal for seam blending.
+	struct PortalEdge {
+		int portal = -1;
+		Vector3 a;
+		Vector3 b;
+		Vector3 na;
+		Vector3 nb;
+		Vector2 uva;
+		Vector2 uvb;
+		uint32_t slice = 0;
+	};
+
 	struct Seam {
 		Vector2i a;
 		Vector2i b;
