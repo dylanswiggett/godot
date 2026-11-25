@@ -2212,6 +2212,15 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 			}
 		}
 
+		// Without a real-time directional light, use a static one: its direct light is in the
+		// lightmap, and the shadowmask tells where it reaches (directly and through each portal), so
+		// dynamic objects' shadows can be taken out of it at runtime.
+		for (int i = 0; i < lights.size() && shadowmask_light_idx < 0; i++) {
+			if (lights[i].type == LightType::LIGHT_TYPE_DIRECTIONAL) {
+				shadowmask_light_idx = i;
+			}
+		}
+
 		if (shadowmask_lights_count > 1) {
 			WARN_PRINT(
 					vformat("%d directional lights detected for shadowmask baking. Only %s will be used.",
