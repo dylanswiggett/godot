@@ -331,15 +331,31 @@ class LightmapperRD : public Lightmapper {
 		int half_search_window;
 		float filter_strength;
 		uint32_t slice_count;
-		uint32_t pad;
+		uint32_t portal_pair_count;
 	};
+
+	// See DenoisePortalPair in lm_compute.glsl.
+	struct DenoisePortalPair {
+		uint32_t key = 0;
+		uint32_t portal = 0;
+		uint32_t exit_slice = 0;
+		uint32_t pad = 0;
+		float base[2] = {};
+		float pad2[2] = {};
+		float offset_map[4] = {};
+	};
+	struct DenoisePortalPairKeyComparator {
+		_FORCE_INLINE_ bool operator()(const DenoisePortalPair &p_a, const DenoisePortalPair &p_b) const { return p_a.key < p_b.key; }
+	};
+
+	LocalVector<DenoisePortalPair> _find_denoise_portal_pairs(RenderingDevice *p_rd, RID p_position_tex, RID p_normal_tex, const Size2i &p_atlas_size, int p_atlas_slices, int p_denoiser_range);
 
 	BakeError _blit_meshes_into_atlas(int p_max_texture_size, int p_denoiser_range, Vector<Ref<Image>> &albedo_images, Vector<Ref<Image>> &emission_images, AABB &bounds, Size2i &atlas_size, int &atlas_slices, float p_supersampling_factor, BakeStepFunc p_step_function, void *p_bake_userdata);
 	void _create_acceleration_structures(RenderingDevice *rd, Size2i atlas_size, int atlas_slices, AABB &bounds, int grid_size, uint32_t p_cluster_size, Vector<Probe> &probe_positions, GenerateProbes p_generate_probes, Vector<int> &slice_triangle_count, Vector<int> &slice_seam_count, RID &vertex_buffer, RID &triangle_buffer, RID &lights_buffer, RID &r_triangle_indices_buffer, RID &r_cluster_indices_buffer, RID &r_cluster_aabbs_buffer, RID &probe_positions_buffer, RID &grid_texture, RID &seams_buffer, BakeStepFunc p_step_function, void *p_bake_userdata);
 	void _raster_geometry(RenderingDevice *rd, Size2i atlas_size, int atlas_slices, int grid_size, AABB bounds, float p_bias, Vector<int> slice_triangle_count, RID position_tex, RID unocclude_tex, RID normal_tex, RID raster_depth_buffer, RID rasterize_shader, RID raster_base_uniform);
 
 	BakeError _dilate(RenderingDevice *rd, Ref<RDShaderFile> &compute_shader, RID &compute_base_uniform_set, PushConstant &push_constant, RID &source_light_tex, RID &dest_light_tex, const Size2i &atlas_size, int atlas_slices);
-	BakeError _denoise(RenderingDevice *p_rd, Ref<RDShaderFile> &p_compute_shader, const RID &p_compute_base_uniform_set, PushConstant &p_push_constant, RID p_source_light_tex, RID p_source_normal_tex, RID p_dest_light_tex, RID p_unocclude_tex, float p_denoiser_strength, int p_denoiser_range, const Size2i &p_atlas_size, int p_atlas_slices, bool p_bake_sh, BakeStepFunc p_step_function, void *p_bake_userdata);
+	BakeError _denoise(RenderingDevice *p_rd, Ref<RDShaderFile> &p_compute_shader, const RID &p_compute_base_uniform_set, PushConstant &p_push_constant, RID p_source_light_tex, RID p_source_normal_tex, RID p_source_position_tex, RID p_dest_light_tex, RID p_unocclude_tex, const LocalVector<DenoisePortalPair> &p_portal_pairs, float p_denoiser_strength, int p_denoiser_range, const Size2i &p_atlas_size, int p_atlas_slices, bool p_bake_sh, BakeStepFunc p_step_function, void *p_bake_userdata);
 	BakeError _pack_l1(RenderingDevice *rd, Ref<RDShaderFile> &compute_shader, RID &compute_base_uniform_set, PushConstant &push_constant, RID &source_light_tex, RID &dest_light_tex, const Size2i &atlas_size, int atlas_slices);
 	BakeError _portal_seams(RenderingDevice *rd, Ref<RDShaderFile> &compute_shader, RID &compute_base_uniform_set, PushConstant &push_constant, RID &source_tex, RID &position_tex, RID &normal_tex, RID &dest_tex, const Size2i &atlas_size, int atlas_slices, int layers_per_slice);
 	BakeError _composite_direct(RenderingDevice *rd, Ref<RDShaderFile> &compute_shader, RID &compute_base_uniform_set, PushConstant &push_constant, RID &source_light_tex, RID &direct_light_tex, RID &dest_light_tex, const Size2i &atlas_size, int atlas_slices);

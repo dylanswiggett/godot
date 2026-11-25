@@ -1308,7 +1308,230 @@ LightmapperRD::BakeError LightmapperRD::_denoise_oidn(RenderingDevice *p_rd, RID
 	return BAKE_OK;
 }
 
-LightmapperRD::BakeError LightmapperRD::_denoise(RenderingDevice *p_rd, Ref<RDShaderFile> &p_compute_shader, const RID &p_compute_base_uniform_set, PushConstant &p_push_constant, RID p_source_light_tex, RID p_source_normal_tex, RID p_dest_light_tex, RID p_unocclude_tex, float p_denoiser_strength, int p_denoiser_range, const Size2i &p_atlas_size, int p_atlas_slices, bool p_bake_sh, BakeStepFunc p_step_function, void *p_bake_userdata) {
+// For the denoiser (see MODE_DENOISE in lm_compute.glsl): pairs each texel in front of a portal
+// opening, on a surface passing through it and within the denoiser's reach of it, with where its
+// surface continues out of the portal's exit: the exit side's chart, at the atlas position of the
+// texel's position carried through the portal (past that chart's edge, which is at the exit's
+// plane), and how atlas offsets around the texel map to that chart's (which may be rotated,
+// mirrored or scaled relative to the texel's).
+LocalVector<LightmapperRD::DenoisePortalPair> LightmapperRD::_find_denoise_portal_pairs(RenderingDevice *p_rd, RID p_position_tex, RID p_normal_tex, const Size2i &p_atlas_size, int p_atlas_slices, int p_denoiser_range) {
+	LocalVector<DenoisePortalPair> pairs;
+	if (portals.is_empty()) {
+		return pairs;
+	}
+	const int w = p_atlas_size.width;
+	const int h = p_atlas_size.height;
+	LocalVector<Vector<uint8_t>> position_data;
+	LocalVector<Vector<uint8_t>> normal_data;
+	for (int s = 0; s < p_atlas_slices; s++) {
+		position_data.push_back(p_rd->texture_get_data(p_position_tex, s));
+		normal_data.push_back(p_rd->texture_get_data(p_normal_tex, s));
+	}
+	auto position_at = [&](int s, int x, int y, Vector3 &r_position) -> bool {
+		if (x < 0 || y < 0 || x >= w || y >= h) {
+			return false;
+		}
+		const float *p = reinterpret_cast<const float *>(position_data[s].ptr()) + (y * w + x) * 4;
+		if (p[3] < 0.001) {
+			return false;
+		}
+		r_position = Vector3(p[0], p[1], p[2]);
+		return true;
+	};
+	auto normal_at = [&](int s, int x, int y) -> Vector3 {
+		const uint16_t *n = reinterpret_cast<const uint16_t *>(normal_data[s].ptr()) + (y * w + x) * 4;
+		return Vector3(Math::half_to_float(n[0]), Math::half_to_float(n[1]), Math::half_to_float(n[2])).normalized();
+	};
+	// The world offsets of one atlas step in x and in y at a texel, from its used neighbors on the
+	// same surface (texels of other charts nearby in the atlas are much farther away), and the
+	// distance to its nearest one.
+	auto atlas_frame = [&](int s, int x, int y, const Vector3 &p_position, Vector3 &r_dx, Vector3 &r_dy, real_t &r_spacing) -> bool {
+		const Vector2i offsets[4] = { Vector2i(1, 0), Vector2i(-1, 0), Vector2i(0, 1), Vector2i(0, -1) };
+		Vector3 neighbors[4];
+		bool used[4];
+		r_spacing = 1e20;
+		for (int i = 0; i < 4; i++) {
+			used[i] = position_at(s, x + offsets[i].x, y + offsets[i].y, neighbors[i]);
+			if (used[i]) {
+				r_spacing = MIN(r_spacing, p_position.distance_to(neighbors[i]));
+			}
+		}
+		if (r_spacing >= 1e19 || r_spacing <= 0.0) {
+			return false;
+		}
+		for (int axis = 0; axis < 2; axis++) {
+			Vector3 &d = axis == 0 ? r_dx : r_dy;
+			int forward = axis * 2;
+			int backward = axis * 2 + 1;
+			if (used[forward] && p_position.distance_to(neighbors[forward]) < 3.0 * r_spacing) {
+				d = neighbors[forward] - p_position;
+			} else if (used[backward] && p_position.distance_to(neighbors[backward]) < 3.0 * r_spacing) {
+				d = p_position - neighbors[backward];
+			} else {
+				return false;
+			}
+		}
+		return true;
+	};
+
+	struct PortalFrame {
+		Vector3 center, front, right, up;
+		real_t half_width, half_height;
+		Transform3D transfer;
+		Vector3 exit_center, exit_front, exit_right, exit_up;
+	};
+	LocalVector<PortalFrame> frames;
+	const Basis half_turn(Vector3(0, 1, 0), Math::PI);
+	for (const Portal &portal : portals) {
+		PortalFrame f;
+		const Basis &basis = portal.entrance.basis;
+		f.center = portal.entrance.origin;
+		f.front = -basis.get_column(2).normalized();
+		f.right = basis.get_column(0).normalized();
+		f.up = basis.get_column(1).normalized();
+		f.half_width = basis.get_column(0).length() / 2.0;
+		f.half_height = basis.get_column(1).length() / 2.0;
+		f.transfer = portal.exit * Transform3D(half_turn) * portal.entrance.affine_inverse();
+		// What's in front of the entrance maps behind the exit.
+		f.exit_center = f.transfer.xform(f.center);
+		f.exit_front = -f.transfer.basis.xform(f.front).normalized();
+		f.exit_right = f.transfer.basis.xform(f.right).normalized();
+		f.exit_up = f.transfer.basis.xform(f.up).normalized();
+		frames.push_back(f);
+	}
+	const real_t reach_texels = (p_denoiser_range + 2) * 1.5;
+
+	// Where surfaces through each portal's opening leave its exit: their texels just in front of it,
+	// in a grid.
+	struct ExitTexel {
+		Vector3 position;
+		Vector3 normal;
+		int slice, x, y;
+	};
+	const real_t cell_size = 0.25;
+	LocalVector<HashMap<Vector3i, LocalVector<ExitTexel>>> exit_grids;
+	exit_grids.resize(frames.size());
+	for (int s = 0; s < p_atlas_slices; s++) {
+		for (int y = 0; y < h; y++) {
+			for (int x = 0; x < w; x++) {
+				Vector3 position;
+				if (!position_at(s, x, y, position)) {
+					continue;
+				}
+				for (uint32_t i = 0; i < frames.size(); i++) {
+					const PortalFrame &f = frames[i];
+					Vector3 local = position - f.exit_center;
+					real_t depth = local.dot(f.exit_front);
+					if (depth <= 0.0 || depth > 0.5 || Math::abs(local.dot(f.exit_right)) > f.half_width + 0.5 || Math::abs(local.dot(f.exit_up)) > f.half_height + 0.5) {
+						continue;
+					}
+					Vector3 normal = normal_at(s, x, y);
+					if (Math::abs(normal.dot(f.exit_front)) > 0.5) {
+						continue; // Not a surface passing through the opening.
+					}
+					exit_grids[i][Vector3i((position / cell_size).floor())].push_back({ position, normal, s, x, y });
+				}
+			}
+		}
+	}
+
+	for (int s = 0; s < p_atlas_slices; s++) {
+		for (int y = 0; y < h; y++) {
+			for (int x = 0; x < w; x++) {
+				Vector3 position;
+				if (!position_at(s, x, y, position)) {
+					continue;
+				}
+				for (uint32_t i = 0; i < frames.size(); i++) {
+					const PortalFrame &f = frames[i];
+					Vector3 local = position - f.center;
+					real_t depth = local.dot(f.front);
+					if (depth <= 0.0 || depth > 2.0 || Math::abs(local.dot(f.right)) > f.half_width + 2.0 || Math::abs(local.dot(f.up)) > f.half_height + 2.0) {
+						continue; // Cheap rejection before the exact reach below.
+					}
+					Vector3 dx, dy;
+					real_t spacing;
+					if (!atlas_frame(s, x, y, position, dx, dy, spacing)) {
+						continue;
+					}
+					real_t reach = reach_texels * spacing;
+					if (depth > reach || Math::abs(local.dot(f.right)) > f.half_width + reach || Math::abs(local.dot(f.up)) > f.half_height + reach) {
+						continue;
+					}
+					Vector3 normal = normal_at(s, x, y);
+					if (Math::abs(normal.dot(f.front)) > 0.5) {
+						continue;
+					}
+					// The texel's position carried through the portal is behind the exit, past the exit
+					// side's chart edge; anchor on that chart just in front of the exit, along the
+					// surface from there.
+					Vector3 carried = f.transfer.xform(position);
+					Vector3 carried_normal = f.transfer.basis.xform(normal).normalized();
+					Vector3 anchor_point = carried + f.exit_front * (depth + spacing);
+					const ExitTexel *anchor = nullptr;
+					real_t best = 3.0 * spacing;
+					Vector3i cell = Vector3i((anchor_point / cell_size).floor());
+					int cell_reach = int(Math::ceil(best / cell_size));
+					for (int cz = -cell_reach; cz <= cell_reach; cz++) {
+						for (int cy = -cell_reach; cy <= cell_reach; cy++) {
+							for (int cx = -cell_reach; cx <= cell_reach; cx++) {
+								const LocalVector<ExitTexel> *texels = exit_grids[i].getptr(cell + Vector3i(cx, cy, cz));
+								if (texels == nullptr) {
+									continue;
+								}
+								for (const ExitTexel &t : *texels) {
+									real_t distance = t.position.distance_to(anchor_point);
+									if (distance < best && t.normal.dot(carried_normal) > 0.9) {
+										best = distance;
+										anchor = &t;
+									}
+								}
+							}
+						}
+					}
+					if (anchor == nullptr) {
+						continue;
+					}
+					Vector3 anchor_dx, anchor_dy;
+					real_t anchor_spacing;
+					if (!atlas_frame(anchor->slice, anchor->x, anchor->y, anchor->position, anchor_dx, anchor_dy, anchor_spacing)) {
+						continue;
+					}
+					// World offsets to the anchor's atlas offsets: the pseudo-inverse of its frame.
+					real_t gxx = anchor_dx.dot(anchor_dx), gxy = anchor_dx.dot(anchor_dy), gyy = anchor_dy.dot(anchor_dy);
+					real_t det = gxx * gyy - gxy * gxy;
+					if (Math::abs(det) < 1e-12) {
+						continue;
+					}
+					auto to_anchor_atlas = [&](const Vector3 &p_world) -> Vector2 {
+						real_t a = anchor_dx.dot(p_world), b = anchor_dy.dot(p_world);
+						return Vector2(gyy * a - gxy * b, gxx * b - gxy * a) / det;
+					};
+					Vector2 base = Vector2(anchor->x, anchor->y) + to_anchor_atlas(carried - anchor->position);
+					Vector2 map_x = to_anchor_atlas(f.transfer.basis.xform(dx));
+					Vector2 map_y = to_anchor_atlas(f.transfer.basis.xform(dy));
+
+					DenoisePortalPair pair;
+					pair.key = (uint32_t(s) * h + y) * w + x;
+					pair.portal = i;
+					pair.exit_slice = anchor->slice;
+					pair.base[0] = base.x;
+					pair.base[1] = base.y;
+					pair.offset_map[0] = map_x.x;
+					pair.offset_map[1] = map_x.y;
+					pair.offset_map[2] = map_y.x;
+					pair.offset_map[3] = map_y.y;
+					pairs.push_back(pair);
+					break;
+				}
+			}
+		}
+	}
+	pairs.sort_custom<DenoisePortalPairKeyComparator>(); // The denoiser looks texels up by key.
+	return pairs;
+}
+
+LightmapperRD::BakeError LightmapperRD::_denoise(RenderingDevice *p_rd, Ref<RDShaderFile> &p_compute_shader, const RID &p_compute_base_uniform_set, PushConstant &p_push_constant, RID p_source_light_tex, RID p_source_normal_tex, RID p_source_position_tex, RID p_dest_light_tex, RID p_unocclude_tex, const LocalVector<DenoisePortalPair> &p_portal_pairs, float p_denoiser_strength, int p_denoiser_range, const Size2i &p_atlas_size, int p_atlas_slices, bool p_bake_sh, BakeStepFunc p_step_function, void *p_bake_userdata) {
 	RID denoise_params_buffer = p_rd->uniform_buffer_create(sizeof(DenoiseParams));
 	DenoiseParams denoise_params;
 	denoise_params.spatial_bandwidth = 5.0f;
@@ -1318,7 +1541,16 @@ LightmapperRD::BakeError LightmapperRD::_denoise(RenderingDevice *p_rd, Ref<RDSh
 	denoise_params.filter_strength = 10.0f;
 	denoise_params.half_search_window = p_denoiser_range;
 	denoise_params.slice_count = p_bake_sh ? 4 : 1;
+	denoise_params.portal_pair_count = p_portal_pairs.size();
 	p_rd->buffer_update(denoise_params_buffer, 0, sizeof(DenoiseParams), &denoise_params);
+
+	RID portal_pairs_buffer;
+	if (p_portal_pairs.is_empty()) {
+		DenoisePortalPair none;
+		portal_pairs_buffer = p_rd->storage_buffer_create(sizeof(DenoisePortalPair), Span<uint8_t>(reinterpret_cast<const uint8_t *>(&none), sizeof(DenoisePortalPair))); // Storage buffers can't be empty.
+	} else {
+		portal_pairs_buffer = p_rd->storage_buffer_create(p_portal_pairs.size() * sizeof(DenoisePortalPair), p_portal_pairs.span().reinterpret<uint8_t>());
+	}
 
 	Vector<RD::Uniform> uniforms = dilate_or_denoise_common_uniforms(p_source_light_tex, p_dest_light_tex);
 	{
@@ -1340,6 +1572,20 @@ LightmapperRD::BakeError LightmapperRD::_denoise(RenderingDevice *p_rd, Ref<RDSh
 		u.uniform_type = RD::UNIFORM_TYPE_UNIFORM_BUFFER;
 		u.binding = 4;
 		u.append_id(denoise_params_buffer);
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		u.binding = 5;
+		u.append_id(p_source_position_tex);
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.binding = 6;
+		u.append_id(portal_pairs_buffer);
 		uniforms.push_back(u);
 	}
 
@@ -1391,6 +1637,7 @@ LightmapperRD::BakeError LightmapperRD::_denoise(RenderingDevice *p_rd, Ref<RDSh
 
 	p_rd->free_rid(compute_shader_denoise);
 	p_rd->free_rid(denoise_params_buffer);
+	p_rd->free_rid(portal_pairs_buffer);
 
 	return BAKE_OK;
 }
@@ -2557,6 +2804,10 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 		}
 	}
 
+	for (int i = 0; i < atlas_slices; i++) {
+		_debug_save_raw(rd, light_accum_tex, p_bake_sh ? i * 4 : i, atlas_size, 8, vformat("2a_bounce_raw_%d", i));
+	}
+
 	if (p_use_denoiser) {
 		if (p_step_function) {
 			if (p_step_function(0.8, RTR("Denoising"), p_bake_userdata, true)) {
@@ -2582,8 +2833,12 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 				error = _denoise_oidn(rd, light_accum_tex, normal_tex, light_accum_tex, atlas_size, atlas_slices, p_bake_sh, false, oidn_path);
 			} else {
 				// JNLM (built-in).
+				LocalVector<DenoisePortalPair> portal_pairs = _find_denoise_portal_pairs(rd, position_tex, normal_tex, atlas_size, atlas_slices, p_denoiser_range);
+				if (!portals.is_empty()) {
+					print_line(vformat("LightmapperRD: denoiser: %d texels near portal openings also denoise past them.", portal_pairs.size()));
+				}
 				SWAP(light_accum_tex, light_accum_tex2);
-				error = _denoise(rd, compute_shader, compute_base_uniform_set, push_constant, light_accum_tex2, normal_tex, light_accum_tex, unocclude_tex, p_denoiser_strength, p_denoiser_range, atlas_size, atlas_slices, p_bake_sh, p_step_function, p_bake_userdata);
+				error = _denoise(rd, compute_shader, compute_base_uniform_set, push_constant, light_accum_tex2, normal_tex, position_tex, light_accum_tex, unocclude_tex, portal_pairs, p_denoiser_strength, p_denoiser_range, atlas_size, atlas_slices, p_bake_sh, p_step_function, p_bake_userdata);
 			}
 			if (unlikely(error != BAKE_OK)) {
 				return error;
@@ -2592,6 +2847,10 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 
 		// The shadowmask, like the direct light, isn't denoised: it's direct visibility, which isn't
 		// noisy, so static shadows stay as sharp as the rest of the baked direct light.
+	}
+
+	for (int i = 0; i < atlas_slices; i++) {
+		_debug_save_raw(rd, light_accum_tex, p_bake_sh ? i * 4 : i, atlas_size, 8, vformat("2b_bounce_denoised_%d", i));
 	}
 
 	/* ADD DIRECT LIGHT */

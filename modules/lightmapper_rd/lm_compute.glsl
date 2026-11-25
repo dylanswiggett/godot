@@ -108,8 +108,28 @@ layout(set = 1, binding = 4) uniform DenoiseParams {
 	int half_search_window;
 	float filter_strength;
 	uint slice_count;
+	uint portal_pair_count;
 }
 denoise_params;
+
+layout(set = 1, binding = 5) uniform texture2DArray source_position;
+
+// A texel in front of a portal opening, and where its surface continues past the opening, out of
+// the portal's exit, in the exit side's chart (see LightmapperRD::_find_denoise_portal_pairs).
+struct DenoisePortalPair {
+	uint key; // Atlas slice * width * height + y * width + x of the texel. Pairs are sorted by it.
+	uint portal; // The portal it's in front of.
+	uint exit_slice; // The atlas slice of the exit side's chart.
+	uint pad;
+	vec2 base; // The exit side's atlas position of this texel's position carried through the portal.
+	vec2 pad2;
+	vec4 offset_map; // 2x2 (columns xy and zw): this texel's atlas offsets to the exit side's.
+};
+
+layout(set = 1, binding = 6, std430) restrict readonly buffer DenoisePortalPairs {
+	DenoisePortalPair data[];
+}
+denoise_portal_pairs;
 #endif
 
 layout(push_constant, std430) uniform Params {
@@ -867,7 +887,7 @@ void trace_direct_light(vec3 p_position, vec3 p_normal, uint p_light_index, int 
 
 #endif
 
-#ifdef MODE_BOUNCE_LIGHT
+#if defined(MODE_BOUNCE_LIGHT) || defined(MODE_DENOISE)
 // World-space distance from a texel to its nearest used neighbor (texels in other charts nearby in
 // the atlas are much farther away, so the nearest is on the same surface).
 float texel_spacing(ivec2 p_atlas_pos, vec3 p_position) {
@@ -1466,6 +1486,33 @@ void main() {
 	const uint slice_base = params.atlas_slice * slice_count;
 	const bool is_directional = (slice_count == 4);
 
+	// Portal awareness. Neighbors only count if they're near this texel on its surface in world space,
+	// not just near it in the atlas: that leaves out other charts packed next to its own, and the
+	// part of its surface behind a portal's opening (cut off at the opening, see the portal_lightmap
+	// editor plugin). Texels in front of a portal opening also search a second window: where their
+	// surface continues past the opening, out of the portal's exit, in the exit side's chart (see
+	// LightmapperRD::_find_denoise_portal_pairs). So near the opening, both sides denoise over the
+	// same continuous surface.
+	vec4 input_position = texelFetch(sampler2DArray(source_position, linear_sampler), ivec3(atlas_pos, params.atlas_slice), 0);
+	float input_spacing = input_position.w >= 0.001 ? texel_spacing(atlas_pos, input_position.xyz) : 0.0;
+	int pair = -1;
+	if (input_spacing > 0.0 && denoise_params.portal_pair_count > 0) {
+		uint key = (params.atlas_slice * uint(bake_params.atlas_size.y) + uint(atlas_pos.y)) * uint(bake_params.atlas_size.x) + uint(atlas_pos.x);
+		uint lo = 0;
+		uint hi = denoise_params.portal_pair_count;
+		while (lo < hi) {
+			uint mid = (lo + hi) / 2;
+			if (denoise_portal_pairs.data[mid].key < key) {
+				lo = mid + 1;
+			} else {
+				hi = mid;
+			}
+		}
+		if (lo < denoise_params.portal_pair_count && denoise_portal_pairs.data[lo].key == key) {
+			pair = int(lo);
+		}
+	}
+
 	for (uint i = 0; i < slice_count; i++) {
 		uint lightmap_slice = slice_base + i;
 		vec3 denoised_rgb = vec3(0.0f);
@@ -1476,66 +1523,124 @@ void main() {
 			// Compute the denoised pixel if the normal is valid.
 			float sum_weights = 0.0f;
 			vec3 input_rgb = input_light.rgb;
-			for (int search_y = -HALF_SEARCH_WINDOW; search_y <= HALF_SEARCH_WINDOW; search_y++) {
-				for (int search_x = -HALF_SEARCH_WINDOW; search_x <= HALF_SEARCH_WINDOW; search_x++) {
-					ivec2 search_pos = atlas_pos + ivec2(search_x, search_y);
-					vec3 search_rgb = texelFetch(sampler2DArray(source_light, linear_sampler), ivec3(search_pos, lightmap_slice), 0).rgb;
-					vec3 search_albedo = texelFetch(sampler2DArray(albedo_tex, linear_sampler), ivec3(search_pos, params.atlas_slice), 0).rgb;
-					vec3 search_normal = texelFetch(sampler2DArray(source_normal, linear_sampler), ivec3(search_pos, params.atlas_slice), 0).xyz;
-					float search_occlusion = texelFetch(sampler2DArray(unocclude_mask, linear_sampler), ivec3(search_pos, params.atlas_slice), 0).r;
-					float patch_square_dist = 0.0f;
-					for (int offset_y = -HALF_PATCH_WINDOW; offset_y <= HALF_PATCH_WINDOW; offset_y++) {
-						for (int offset_x = -HALF_PATCH_WINDOW; offset_x <= HALF_PATCH_WINDOW; offset_x++) {
-							ivec2 offset_input_pos = atlas_pos + ivec2(offset_x, offset_y);
-							ivec2 offset_search_pos = search_pos + ivec2(offset_x, offset_y);
-							vec3 offset_input_rgb = texelFetch(sampler2DArray(source_light, linear_sampler), ivec3(offset_input_pos, slice_base), 0).rgb;
-							vec3 offset_search_rgb = texelFetch(sampler2DArray(source_light, linear_sampler), ivec3(offset_search_pos, slice_base), 0).rgb;
-							vec3 offset_delta_rgb = offset_input_rgb - offset_search_rgb;
+			vec3 surface_normal = normalize(input_normal);
+			// Window 0: around this texel. Window 1: where its surroundings continue out of a portal's
+			// exit. Offsets are in this texel's atlas frame; the exit side's chart may be rotated or
+			// mirrored relative to it, so window 1 maps them (and its patches' offsets) into that
+			// chart's frame.
+			int windows = pair >= 0 ? 2 : 1;
+			for (int window = 0; window < windows; window++) {
+				uint search_slice = params.atlas_slice;
+				vec2 window_base = vec2(atlas_pos);
+				mat2 offset_map = mat2(1.0);
+				mat4 to_input_space = mat4(1.0);
+				int portal = -1;
+				if (window == 1) {
+					DenoisePortalPair portal_pair = denoise_portal_pairs.data[pair];
+					search_slice = portal_pair.exit_slice;
+					window_base = portal_pair.base;
+					offset_map = mat2(portal_pair.offset_map.xy, portal_pair.offset_map.zw);
+					portal = int(portal_pair.portal);
+					to_input_space = portals.data[portal].inverse_transfer;
+				}
+				uint search_slice_base = search_slice * slice_count;
 
-							if (is_directional) {
-								// Since L0 data is 1/4 the value of a regular lightmap,
-								// we have to multiply it by 4.
-								offset_delta_rgb *= 4.0;
-							}
+				for (int search_y = -HALF_SEARCH_WINDOW; search_y <= HALF_SEARCH_WINDOW; search_y++) {
+					for (int search_x = -HALF_SEARCH_WINDOW; search_x <= HALF_SEARCH_WINDOW; search_x++) {
+						vec2 search_offset = vec2(search_x, search_y);
+						ivec2 search_pos = window == 0 ? atlas_pos + ivec2(search_x, search_y) : ivec2(round(window_base + offset_map * search_offset));
 
-							patch_square_dist += dot(offset_delta_rgb, offset_delta_rgb) - TWO_SIGMA_LIGHT_SQUARE;
+						// Ignore search positions out of bounds.
+						if (any(lessThan(search_pos, ivec2(0))) || any(greaterThanEqual(search_pos, bake_params.atlas_size))) {
+							continue;
 						}
+
+						vec3 search_rgb = texelFetch(sampler2DArray(source_light, linear_sampler), ivec3(search_pos, search_slice_base + i), 0).rgb;
+						vec3 search_albedo = texelFetch(sampler2DArray(albedo_tex, linear_sampler), ivec3(search_pos, search_slice), 0).rgb;
+						vec3 search_normal = texelFetch(sampler2DArray(source_normal, linear_sampler), ivec3(search_pos, search_slice), 0).xyz;
+						float search_occlusion = texelFetch(sampler2DArray(unocclude_mask, linear_sampler), ivec3(search_pos, search_slice), 0).r;
+
+						if (input_spacing > 0.0) {
+							// Only neighbors on this texel's surface (allowing for some curvature), within
+							// reach of the search window, and not behind a portal opening (window 0) or
+							// only through this pair's portal (window 1).
+							vec4 search_position = texelFetch(sampler2DArray(source_position, linear_sampler), ivec3(search_pos, search_slice), 0);
+							if (search_position.w < 0.001) {
+								continue;
+							}
+							vec3 delta = (to_input_space * vec4(search_position.xyz, 1.0)).xyz - input_position.xyz;
+							float distance_world = length(delta);
+							if (distance_world > (length(search_offset) + 2.0) * input_spacing * 1.5 || abs(dot(delta, surface_normal)) > input_spacing + 0.25 * distance_world) {
+								continue;
+							}
+							float crossing_t;
+							int crossed = find_portal_crossing(input_position.xyz, input_position.xyz + delta, crossing_t);
+							if (crossed != portal) {
+								continue;
+							}
+							search_normal = mat3(to_input_space) * search_normal;
+						}
+
+						// Patches: offsets around this texel and the matching ones around the search
+						// texel. Unused texels (past a chart's edge) are left out of the comparison.
+						float patch_square_dist = 0.0f;
+						int patch_count = 0;
+						for (int offset_y = -HALF_PATCH_WINDOW; offset_y <= HALF_PATCH_WINDOW; offset_y++) {
+							for (int offset_x = -HALF_PATCH_WINDOW; offset_x <= HALF_PATCH_WINDOW; offset_x++) {
+								ivec2 offset = ivec2(offset_x, offset_y);
+								ivec2 offset_input_pos = atlas_pos + offset;
+								ivec2 offset_search_pos = search_pos + (window == 0 ? offset : ivec2(round(offset_map * vec2(offset))));
+								vec4 offset_input = texelFetch(sampler2DArray(source_light, linear_sampler), ivec3(offset_input_pos, slice_base), 0);
+								vec4 offset_search = texelFetch(sampler2DArray(source_light, linear_sampler), ivec3(offset_search_pos, search_slice_base), 0);
+								if (offset_input.a < 0.5 || offset_search.a < 0.5) {
+									continue;
+								}
+								vec3 offset_delta_rgb = offset_input.rgb - offset_search.rgb;
+
+								if (is_directional) {
+									// Since L0 data is 1/4 the value of a regular lightmap,
+									// we have to multiply it by 4.
+									offset_delta_rgb *= 4.0;
+								}
+
+								patch_square_dist += dot(offset_delta_rgb, offset_delta_rgb) - TWO_SIGMA_LIGHT_SQUARE;
+								patch_count++;
+							}
+						}
+						if (patch_count == 0) {
+							continue;
+						}
+
+						patch_square_dist = max(0.0f, patch_square_dist / (3.0f * float(patch_count)));
+
+						float weight = 1.0f;
+
+						// Ignore weight if normal is zero length.
+						weight *= step(EPSILON, length(search_normal));
+
+						// Weight with pixel distance.
+						float pixel_square_dist = dot(search_offset, search_offset);
+						weight *= exp(-pixel_square_dist / TWO_SIGMA_SPATIAL_SQUARE);
+
+						// Weight with patch.
+						weight *= exp(-patch_square_dist / FILTER_SQUARE_TWO_SIGMA_LIGHT_SQUARE);
+
+						// Weight with albedo.
+						vec3 albedo_delta = input_albedo - search_albedo;
+						float albedo_square_dist = dot(albedo_delta, albedo_delta);
+						weight *= exp(-albedo_square_dist / TWO_SIGMA_ALBEDO_SQUARE);
+
+						// Weight with normal.
+						vec3 normal_delta = input_normal - search_normal;
+						float normal_square_dist = dot(normal_delta, normal_delta);
+						weight *= exp(-normal_square_dist / TWO_SIGMA_NORMAL_SQUARE);
+
+						// Weight with occlusion.
+						weight *= 1.0 - search_occlusion;
+
+						denoised_rgb += weight * search_rgb;
+						sum_weights += weight;
 					}
-
-					patch_square_dist = max(0.0f, patch_square_dist / (3.0f * PATCH_WINDOW_DIMENSION_SQUARE));
-
-					float weight = 1.0f;
-
-					// Ignore weight if search position is out of bounds.
-					weight *= step(0, search_pos.x) * step(search_pos.x, bake_params.atlas_size.x - 1);
-					weight *= step(0, search_pos.y) * step(search_pos.y, bake_params.atlas_size.y - 1);
-
-					// Ignore weight if normal is zero length.
-					weight *= step(EPSILON, length(search_normal));
-
-					// Weight with pixel distance.
-					vec2 pixel_delta = vec2(search_x, search_y);
-					float pixel_square_dist = dot(pixel_delta, pixel_delta);
-					weight *= exp(-pixel_square_dist / TWO_SIGMA_SPATIAL_SQUARE);
-
-					// Weight with patch.
-					weight *= exp(-patch_square_dist / FILTER_SQUARE_TWO_SIGMA_LIGHT_SQUARE);
-
-					// Weight with albedo.
-					vec3 albedo_delta = input_albedo - search_albedo;
-					float albedo_square_dist = dot(albedo_delta, albedo_delta);
-					weight *= exp(-albedo_square_dist / TWO_SIGMA_ALBEDO_SQUARE);
-
-					// Weight with normal.
-					vec3 normal_delta = input_normal - search_normal;
-					float normal_square_dist = dot(normal_delta, normal_delta);
-					weight *= exp(-normal_square_dist / TWO_SIGMA_NORMAL_SQUARE);
-
-					// Weight with occlusion.
-					weight *= 1.0 - search_occlusion;
-
-					denoised_rgb += weight * search_rgb;
-					sum_weights += weight;
 				}
 			}
 
