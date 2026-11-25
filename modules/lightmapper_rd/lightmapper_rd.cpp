@@ -3351,7 +3351,8 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 		for (int i = 0; i < atlas_slices; i++) {
 			Vector<uint8_t> s = rd->texture_get_data(shadowmask_tex, i);
 			Ref<Image> img = Image::create_from_data(atlas_size.width, atlas_size.height, false, Image::FORMAT_RGBA8, s);
-			img->convert(Image::FORMAT_R8);
+			// R, G and B: the paths (see MODE_DIRECT_LIGHT); Godot's renderer only reads R.
+			img->convert(Image::FORMAT_RGB8);
 			shadowmask_textures.push_back(img);
 		}
 	}
