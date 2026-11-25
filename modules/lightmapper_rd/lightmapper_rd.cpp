@@ -1531,6 +1531,245 @@ LocalVector<LightmapperRD::DenoisePortalPair> LightmapperRD::_find_denoise_porta
 	return pairs;
 }
 
+// Texels just behind a portal's opening, on surfaces passing through it, are what the runtime's
+// bicubic filter blends in at the opening (meshes cut at openings by the portal_lightmap editor
+// plugin are still unwrapped into charts that continue past the cut). Their own light is that of
+// the hidden geometry behind the portal, which can be very different (the sun can reach it while
+// the surface's continuation through the portal is in shade). This finds, for each such texel up
+// to a few texels behind the plane, the texels on the other side where its position continues
+// through the portal, with weights, so their light can be copied in (see _apply_portal_fills).
+void LightmapperRD::_find_portal_fills(RenderingDevice *p_rd, RID p_position_tex, RID p_normal_tex, const Size2i &p_atlas_size, int p_atlas_slices, LocalVector<PortalFill> &r_fills, LocalVector<PortalFillTap> &r_taps, int &r_unfilled) {
+	r_unfilled = 0;
+	if (portals.is_empty()) {
+		return;
+	}
+	const int w = p_atlas_size.width;
+	const int h = p_atlas_size.height;
+	LocalVector<Vector<uint8_t>> position_data;
+	LocalVector<Vector<uint8_t>> normal_data;
+	for (int s = 0; s < p_atlas_slices; s++) {
+		position_data.push_back(p_rd->texture_get_data(p_position_tex, s));
+		normal_data.push_back(p_rd->texture_get_data(p_normal_tex, s));
+	}
+	auto position_at = [&](int s, int x, int y, Vector3 &r_position) -> bool {
+		if (x < 0 || y < 0 || x >= w || y >= h) {
+			return false;
+		}
+		const float *p = reinterpret_cast<const float *>(position_data[s].ptr()) + (y * w + x) * 4;
+		if (p[3] < 0.001) {
+			return false;
+		}
+		r_position = Vector3(p[0], p[1], p[2]);
+		return true;
+	};
+	auto normal_at = [&](int s, int x, int y) -> Vector3 {
+		const uint16_t *n = reinterpret_cast<const uint16_t *>(normal_data[s].ptr()) + (y * w + x) * 4;
+		return Vector3(Math::half_to_float(n[0]), Math::half_to_float(n[1]), Math::half_to_float(n[2])).normalized();
+	};
+	// World distance to the nearest used atlas neighbor (on the same surface: other charts' texels
+	// nearby in the atlas are much farther away).
+	auto spacing_at = [&](int s, int x, int y, const Vector3 &p_position) -> real_t {
+		real_t spacing = 1e20;
+		const Vector2i offsets[4] = { Vector2i(1, 0), Vector2i(-1, 0), Vector2i(0, 1), Vector2i(0, -1) };
+		for (const Vector2i &o : offsets) {
+			Vector3 neighbor;
+			if (position_at(s, x + o.x, y + o.y, neighbor)) {
+				spacing = MIN(spacing, p_position.distance_to(neighbor));
+			}
+		}
+		return spacing < 1e19 ? spacing : 0.0;
+	};
+
+	struct PortalFrame {
+		Vector3 center, front, right, up;
+		real_t half_width, half_height;
+		Transform3D transfer;
+		Basis rotation;
+		Vector3 exit_center, exit_front, exit_right, exit_up;
+	};
+	LocalVector<PortalFrame> frames;
+	const Basis half_turn(Vector3(0, 1, 0), Math::PI);
+	for (const Portal &portal : portals) {
+		PortalFrame f;
+		const Basis &basis = portal.entrance.basis;
+		f.center = portal.entrance.origin;
+		f.front = -basis.get_column(2).normalized();
+		f.right = basis.get_column(0).normalized();
+		f.up = basis.get_column(1).normalized();
+		f.half_width = basis.get_column(0).length() / 2.0;
+		f.half_height = basis.get_column(1).length() / 2.0;
+		f.transfer = portal.exit * Transform3D(half_turn) * portal.entrance.affine_inverse();
+		f.rotation = f.transfer.basis.orthonormalized();
+		// What's behind the entrance continues in front of the exit.
+		f.exit_center = f.transfer.xform(f.center);
+		f.exit_front = -f.rotation.xform(f.front);
+		f.exit_right = f.rotation.xform(f.right);
+		f.exit_up = f.rotation.xform(f.up);
+		frames.push_back(f);
+	}
+
+	// The texels in front of each portal's exit, on surfaces passing through it, in a grid.
+	const real_t near_plane = 0.6; // Covers several texels at any reasonable texel size.
+	const real_t cell_size = 0.25;
+	struct ExitTexel {
+		Vector3 position;
+		Vector3 normal;
+		uint32_t texel;
+	};
+	LocalVector<HashMap<Vector3i, LocalVector<ExitTexel>>> exit_grids;
+	exit_grids.resize(frames.size());
+	for (int s = 0; s < p_atlas_slices; s++) {
+		for (int y = 0; y < h; y++) {
+			for (int x = 0; x < w; x++) {
+				Vector3 position;
+				if (!position_at(s, x, y, position)) {
+					continue;
+				}
+				for (uint32_t i = 0; i < frames.size(); i++) {
+					const PortalFrame &f = frames[i];
+					Vector3 local = position - f.exit_center;
+					real_t depth = local.dot(f.exit_front);
+					if (depth <= 0.0 || depth > near_plane || Math::abs(local.dot(f.exit_right)) > f.half_width + near_plane || Math::abs(local.dot(f.exit_up)) > f.half_height + near_plane) {
+						continue;
+					}
+					Vector3 normal = normal_at(s, x, y);
+					if (Math::abs(normal.dot(f.exit_front)) > 0.5) {
+						continue;
+					}
+					exit_grids[i][Vector3i((position / cell_size).floor())].push_back({ position, normal, uint32_t((s * h + y) * w + x) });
+				}
+			}
+		}
+	}
+
+	const real_t behind_texels = 3.0;
+	for (int s = 0; s < p_atlas_slices; s++) {
+		for (int y = 0; y < h; y++) {
+			for (int x = 0; x < w; x++) {
+				Vector3 position;
+				if (!position_at(s, x, y, position)) {
+					continue;
+				}
+				for (uint32_t i = 0; i < frames.size(); i++) {
+					const PortalFrame &f = frames[i];
+					Vector3 local = position - f.center;
+					real_t depth = local.dot(f.front);
+					if (depth >= 0.0 || depth < -near_plane || Math::abs(local.dot(f.right)) > f.half_width + near_plane || Math::abs(local.dot(f.up)) > f.half_height + near_plane) {
+						continue; // Cheap rejection before the exact test below.
+					}
+					real_t spacing = spacing_at(s, x, y, position);
+					if (spacing <= 0.0 || depth < -behind_texels * spacing || Math::abs(local.dot(f.right)) > f.half_width + spacing || Math::abs(local.dot(f.up)) > f.half_height + spacing) {
+						continue;
+					}
+					Vector3 normal = normal_at(s, x, y);
+					if (Math::abs(normal.dot(f.front)) > 0.5) {
+						continue; // Not a surface passing through the opening.
+					}
+					// Where this texel continues, and the texels there on the same surface: a tent
+					// filter one texel wide, or the nearest within one and a half.
+					Vector3 continued = f.transfer.xform(position);
+					Vector3 continued_normal = f.rotation.xform(normal);
+					uint32_t first_tap = r_taps.size();
+					const ExitTexel *nearest = nullptr;
+					real_t nearest_distance = 1.5 * spacing;
+					Vector3i cell = Vector3i((continued / cell_size).floor());
+					int cell_reach = int(Math::ceil(1.5 * spacing / cell_size));
+					for (int cz = -cell_reach; cz <= cell_reach; cz++) {
+						for (int cy = -cell_reach; cy <= cell_reach; cy++) {
+							for (int cx = -cell_reach; cx <= cell_reach; cx++) {
+								const LocalVector<ExitTexel> *texels = exit_grids[i].getptr(cell + Vector3i(cx, cy, cz));
+								if (texels == nullptr) {
+									continue;
+								}
+								for (const ExitTexel &t : *texels) {
+									if (t.normal.dot(continued_normal) < 0.9) {
+										continue;
+									}
+									real_t distance = t.position.distance_to(continued);
+									if (distance < spacing) {
+										r_taps.push_back({ t.texel, float(1.0 - distance / spacing) });
+									}
+									if (distance < nearest_distance) {
+										nearest_distance = distance;
+										nearest = &t;
+									}
+								}
+							}
+						}
+					}
+					if (r_taps.size() == first_tap && nearest != nullptr) {
+						r_taps.push_back({ nearest->texel, 1.0f });
+					}
+					if (r_taps.size() == first_tap) {
+						r_unfilled++;
+						break;
+					}
+					PortalFill fill;
+					fill.texel = uint32_t((s * h + y) * w + x);
+					fill.first_tap = first_tap;
+					fill.tap_count = r_taps.size() - first_tap;
+					r_fills.push_back(fill);
+					break;
+				}
+			}
+		}
+	}
+}
+
+// Copies the light (or shadowmask) found by _find_portal_fills into the texels behind portal
+// openings.
+void LightmapperRD::_apply_portal_fills(RenderingDevice *p_rd, RID p_tex, int p_layers_per_slice, bool p_half_float, const LocalVector<PortalFill> &p_fills, const LocalVector<PortalFillTap> &p_taps, const Size2i &p_atlas_size, int p_atlas_slices) {
+	if (p_fills.is_empty()) {
+		return;
+	}
+	const uint32_t texels_per_slice = p_atlas_size.width * p_atlas_size.height;
+	for (int l = 0; l < p_layers_per_slice; l++) {
+		LocalVector<Vector<uint8_t>> source;
+		for (int s = 0; s < p_atlas_slices; s++) {
+			source.push_back(p_rd->texture_get_data(p_tex, s * p_layers_per_slice + l));
+		}
+		auto read = [&](uint32_t p_texel) -> Color {
+			const uint8_t *data = source[p_texel / texels_per_slice].ptr();
+			uint32_t i = p_texel % texels_per_slice;
+			if (p_half_float) {
+				const uint16_t *c = reinterpret_cast<const uint16_t *>(data) + i * 4;
+				return Color(Math::half_to_float(c[0]), Math::half_to_float(c[1]), Math::half_to_float(c[2]), Math::half_to_float(c[3]));
+			}
+			const uint8_t *c = data + i * 4;
+			return Color(c[0], c[1], c[2], c[3]) / 255.0;
+		};
+		LocalVector<Vector<uint8_t>> dest;
+		for (const Vector<uint8_t> &slice : source) {
+			dest.push_back(slice);
+		}
+		for (const PortalFill &fill : p_fills) {
+			Color sum;
+			float weight_sum = 0.0;
+			for (uint32_t t = fill.first_tap; t < fill.first_tap + fill.tap_count; t++) {
+				sum += read(p_taps[t].texel) * p_taps[t].weight;
+				weight_sum += p_taps[t].weight;
+			}
+			Color c = sum / weight_sum;
+			uint8_t *data = dest[fill.texel / texels_per_slice].ptrw();
+			uint32_t i = fill.texel % texels_per_slice;
+			if (p_half_float) {
+				uint16_t *out = reinterpret_cast<uint16_t *>(data) + i * 4;
+				for (int k = 0; k < 4; k++) {
+					out[k] = Math::make_half_float(c.components[k]);
+				}
+			} else {
+				uint8_t *out = data + i * 4;
+				for (int k = 0; k < 4; k++) {
+					out[k] = uint8_t(CLAMP(Math::round(c.components[k] * 255.0), 0, 255));
+				}
+			}
+		}
+		for (int s = 0; s < p_atlas_slices; s++) {
+			p_rd->texture_update(p_tex, s * p_layers_per_slice + l, dest[s]);
+		}
+	}
+}
+
 LightmapperRD::BakeError LightmapperRD::_denoise(RenderingDevice *p_rd, Ref<RDShaderFile> &p_compute_shader, const RID &p_compute_base_uniform_set, PushConstant &p_push_constant, RID p_source_light_tex, RID p_source_normal_tex, RID p_source_position_tex, RID p_dest_light_tex, RID p_unocclude_tex, const LocalVector<DenoisePortalPair> &p_portal_pairs, float p_denoiser_strength, int p_denoiser_range, const Size2i &p_atlas_size, int p_atlas_slices, bool p_bake_sh, BakeStepFunc p_step_function, void *p_bake_userdata) {
 	RID denoise_params_buffer = p_rd->uniform_buffer_create(sizeof(DenoiseParams));
 	DenoiseParams denoise_params;
@@ -2877,6 +3116,20 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 			if (unlikely(error != BAKE_OK)) {
 				return error;
 			}
+		}
+	}
+
+	/* PORTAL FILL */
+
+	if (!portals.is_empty()) {
+		LocalVector<PortalFill> fills;
+		LocalVector<PortalFillTap> taps;
+		int unfilled = 0;
+		_find_portal_fills(rd, position_tex, normal_tex, atlas_size, atlas_slices, fills, taps, unfilled);
+		print_line(vformat("LightmapperRD: %d texels behind portal openings filled with the light where they continue through the portals (%d with nothing found there).", fills.size(), unfilled));
+		_apply_portal_fills(rd, light_accum_tex, p_bake_sh ? 4 : 1, true, fills, taps, atlas_size, atlas_slices);
+		if (p_bake_shadowmask) {
+			_apply_portal_fills(rd, shadowmask_tex, 1, false, fills, taps, atlas_size, atlas_slices);
 		}
 	}
 

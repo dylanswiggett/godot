@@ -348,6 +348,20 @@ class LightmapperRD : public Lightmapper {
 		_FORCE_INLINE_ bool operator()(const DenoisePortalPair &p_a, const DenoisePortalPair &p_b) const { return p_a.key < p_b.key; }
 	};
 
+	// See _find_portal_fills.
+	struct PortalFillTap {
+		uint32_t texel = 0; // (Atlas slice * height + y) * width + x.
+		float weight = 0.0f;
+	};
+	struct PortalFill {
+		uint32_t texel = 0;
+		uint32_t first_tap = 0;
+		uint32_t tap_count = 0;
+	};
+
+	void _find_portal_fills(RenderingDevice *p_rd, RID p_position_tex, RID p_normal_tex, const Size2i &p_atlas_size, int p_atlas_slices, LocalVector<PortalFill> &r_fills, LocalVector<PortalFillTap> &r_taps, int &r_unfilled);
+	void _apply_portal_fills(RenderingDevice *p_rd, RID p_tex, int p_layers_per_slice, bool p_half_float, const LocalVector<PortalFill> &p_fills, const LocalVector<PortalFillTap> &p_taps, const Size2i &p_atlas_size, int p_atlas_slices);
+
 	LocalVector<DenoisePortalPair> _find_denoise_portal_pairs(RenderingDevice *p_rd, RID p_position_tex, RID p_normal_tex, const Size2i &p_atlas_size, int p_atlas_slices, int p_denoiser_range);
 
 	BakeError _blit_meshes_into_atlas(int p_max_texture_size, int p_denoiser_range, Vector<Ref<Image>> &albedo_images, Vector<Ref<Image>> &emission_images, AABB &bounds, Size2i &atlas_size, int &atlas_slices, float p_supersampling_factor, BakeStepFunc p_step_function, void *p_bake_userdata);
