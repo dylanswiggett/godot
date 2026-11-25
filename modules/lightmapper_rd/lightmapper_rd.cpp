@@ -3043,6 +3043,17 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 		}
 	}
 
+	// Direct light is added to the bounces before denoising, unless it's kept sharp (see
+	// rendering/lightmapping/denoising/denoise_direct_light), in which case it's added after.
+	const bool denoise_direct_light = GLOBAL_GET("rendering/lightmapping/denoising/denoise_direct_light");
+	if (denoise_direct_light) {
+		SWAP(light_accum_tex, light_accum_tex2);
+		BakeError error = _composite_direct(rd, compute_shader, compute_base_uniform_set, push_constant, light_accum_tex2, light_direct_tex, light_accum_tex, atlas_size, atlas_slices);
+		if (unlikely(error != BAKE_OK)) {
+			return error;
+		}
+	}
+
 	for (int i = 0; i < atlas_slices; i++) {
 		_debug_save_raw(rd, light_accum_tex, p_bake_sh ? i * 4 : i, atlas_size, 8, vformat("2a_bounce_raw_%d", i));
 	}
@@ -3084,8 +3095,8 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 			}
 		}
 
-		// The shadowmask, like the direct light, isn't denoised: it's direct visibility, which isn't
-		// noisy, so static shadows stay as sharp as the rest of the baked direct light.
+		// The shadowmask isn't denoised: it's direct visibility, which isn't noisy for small lights,
+		// so static shadows stay as sharp as the baked direct light (when that's kept sharp).
 	}
 
 	for (int i = 0; i < atlas_slices; i++) {
@@ -3094,7 +3105,7 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 
 	/* ADD DIRECT LIGHT */
 
-	{
+	if (!denoise_direct_light) {
 		SWAP(light_accum_tex, light_accum_tex2);
 		BakeError error = _composite_direct(rd, compute_shader, compute_base_uniform_set, push_constant, light_accum_tex2, light_direct_tex, light_accum_tex, atlas_size, atlas_slices);
 		if (unlikely(error != BAKE_OK)) {

@@ -62,6 +62,9 @@ void initialize_lightmapper_rd_module(ModuleInitializationLevel p_level) {
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/lightmapping/bake_performance/max_rays_per_probe_pass", PROPERTY_HINT_RANGE, "1,256,1,or_greater"), 64);
 
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/lightmapping/denoising/denoiser", PROPERTY_HINT_ENUM, "JNLM,OIDN"), 0);
+	// Off keeps direct light out of the denoiser, so shadows from small lights stay sharp; on
+	// denoises it with the bounces, for soft lights (large lights and suns) whose penumbrae are noisy.
+	GLOBAL_DEF("rendering/lightmapping/denoising/denoise_direct_light", true);
 #ifndef _3D_DISABLED
 	GDREGISTER_CLASS(LightmapperRD);
 	Lightmapper::create_gpu = create_lightmapper_rd;

@@ -1195,8 +1195,9 @@ void main() {
 	light_for_bounces *= bake_params.exposure_normalization;
 	imageStore(dest_light, ivec3(atlas_pos, params.atlas_slice), vec4(light_for_bounces, 1.0));
 
-	// Direct light is kept apart, to be added after denoising (it isn't noisy). accum_light starts
-	// empty for the bounces; its alpha marks the texel as used.
+	// Direct light is kept apart, to be added to the bounces before or after denoising (see
+	// rendering/lightmapping/denoising/denoise_direct_light). accum_light starts empty for the
+	// bounces; its alpha marks the texel as used.
 #ifdef USE_SH_LIGHTMAPS
 	for (int i = 0; i < 4; i++) {
 		imageStore(direct_light, ivec3(atlas_pos, params.atlas_slice * 4 + i), sh_accum[i]);
