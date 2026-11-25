@@ -36,6 +36,7 @@
 
 #include "core/config/project_settings.h"
 #include "core/io/dir_access.h"
+#include "core/io/file_access.h"
 #include "core/math/geometry_2d.h"
 #include "core/math/geometry_3d.h"
 #include "core/os/os.h"
@@ -910,6 +911,160 @@ LightmapperRD::BakeError LightmapperRD::_pack_l1(RenderingDevice *rd, Ref<RDShad
 	return BAKE_OK;
 }
 
+// Debugging: if the GODOT_LIGHTMAP_DEBUG_DIR environment variable is set, bake textures are saved
+// there as PNGs at a few stages (light converted to sRGB and clamped; empty texels black).
+static String _debug_dir() {
+	return OS::get_singleton()->get_environment("GODOT_LIGHTMAP_DEBUG_DIR");
+}
+
+static void _debug_save_texture(RenderingDevice *p_rd, RID p_tex, int p_layer, const Size2i &p_size, Image::Format p_format, const String &p_name) {
+	const String dir = _debug_dir();
+	if (dir.is_empty()) {
+		return;
+	}
+	DirAccess::make_dir_recursive_absolute(dir);
+	Ref<Image> img = Image::create_from_data(p_size.width, p_size.height, false, p_format, p_rd->texture_get_data(p_tex, p_layer));
+	img->convert(Image::FORMAT_RGBA8);
+	if (p_format != Image::FORMAT_RGBA8) {
+		img->linear_to_srgb();
+	}
+	img->convert(Image::FORMAT_RGB8);
+	img->save_png(dir.path_join(p_name + ".png"));
+}
+
+// Saves a texture layer's raw data: a header (width, height, bytes per texel as int32), then the
+// texels as stored (e.g. RGBA float32 for positions, RGBA float16 for light).
+static void _debug_save_raw(RenderingDevice *p_rd, RID p_tex, int p_layer, const Size2i &p_size, int p_bytes_per_texel, const String &p_name) {
+	const String dir = _debug_dir();
+	if (dir.is_empty()) {
+		return;
+	}
+	DirAccess::make_dir_recursive_absolute(dir);
+	Ref<FileAccess> file = FileAccess::open(dir.path_join(p_name + ".raw"), FileAccess::WRITE);
+	ERR_FAIL_COND(file.is_null());
+	file->store_32(p_size.width);
+	file->store_32(p_size.height);
+	file->store_32(p_bytes_per_texel);
+	file->store_buffer(p_rd->texture_get_data(p_tex, p_layer));
+}
+
+// Saves each texel's world-space size (distance to the next texel along X, as the direct light
+// pass uses for anti-aliasing) as a gray level, white at twice the median, and prints the median.
+static void _debug_save_texel_sizes(RenderingDevice *p_rd, RID p_position_tex, int p_layer, const Size2i &p_size, const String &p_name) {
+	const String dir = _debug_dir();
+	if (dir.is_empty()) {
+		return;
+	}
+	DirAccess::make_dir_recursive_absolute(dir);
+	Ref<Image> positions = Image::create_from_data(p_size.width, p_size.height, false, Image::FORMAT_RGBAF, p_rd->texture_get_data(p_position_tex, p_layer));
+	Vector<float> sizes;
+	sizes.resize(p_size.width * p_size.height);
+	LocalVector<float> valid;
+	for (int y = 0; y < p_size.height; y++) {
+		for (int x = 0; x < p_size.width; x++) {
+			float size = -1.0;
+			Color here = positions->get_pixel(x, y);
+			if (x + 1 < p_size.width && here.a >= 0.001) {
+				Color next = positions->get_pixel(x + 1, y);
+				if (next.a >= 0.001) {
+					size = Vector3(here.r, here.g, here.b).distance_to(Vector3(next.r, next.g, next.b));
+					valid.push_back(size);
+				}
+			}
+			sizes.write[y * p_size.width + x] = size;
+		}
+	}
+	if (valid.is_empty()) {
+		return;
+	}
+	valid.sort();
+	float median = valid[valid.size() / 2];
+	print_line(vformat("LightmapperRD debug: %s: median texel size %.4f m (min %.4f, max %.4f).", p_name, median, valid[0], valid[valid.size() - 1]));
+	Ref<Image> img = Image::create_empty(p_size.width, p_size.height, false, Image::FORMAT_RGB8);
+	for (int y = 0; y < p_size.height; y++) {
+		for (int x = 0; x < p_size.width; x++) {
+			float size = sizes[y * p_size.width + x];
+			float v = size < 0.0 ? 0.0 : CLAMP(size / (2.0 * median), 0.0, 1.0);
+			img->set_pixel(x, y, Color(v, v, v));
+		}
+	}
+	img->save_png(dir.path_join(p_name + ".png"));
+}
+
+// Texels just behind a portal's opening take the values of the nearest texel in front of it on the
+// same surface (see MODE_PORTAL_SEAMS), for a light or shadowmask texture.
+LightmapperRD::BakeError LightmapperRD::_portal_seams(RenderingDevice *rd, Ref<RDShaderFile> &compute_shader, RID &compute_base_uniform_set, PushConstant &push_constant, RID &source_tex, RID &position_tex, RID &dest_tex, const Size2i &atlas_size, int atlas_slices, int layers_per_slice) {
+	Vector<RD::Uniform> uniforms = dilate_or_denoise_common_uniforms(source_tex, dest_tex);
+	{
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		u.binding = 2;
+		u.append_id(position_tex);
+		uniforms.push_back(u);
+	}
+
+	RID compute_shader_seams = rd->shader_create_from_spirv(compute_shader->get_spirv_stages("portal_seams"));
+	ERR_FAIL_COND_V(compute_shader_seams.is_null(), BAKE_ERROR_LIGHTMAP_CANT_PRE_BAKE_MESHES); //internal check, should not happen
+	RID compute_shader_seams_pipeline = rd->compute_pipeline_create(compute_shader_seams);
+
+	RID seams_uniform_set = rd->uniform_set_create(uniforms, compute_shader_seams, 1);
+
+	RD::ComputeListID compute_list = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(compute_list, compute_shader_seams_pipeline);
+	rd->compute_list_bind_uniform_set(compute_list, compute_base_uniform_set, 0);
+	rd->compute_list_bind_uniform_set(compute_list, seams_uniform_set, 1);
+	push_constant.region_ofs[0] = 0;
+	push_constant.region_ofs[1] = 0;
+	push_constant.ray_count = layers_per_slice;
+	Vector3i group_size(Math::division_round_up(atlas_size.x, 8), Math::division_round_up(atlas_size.y, 8), 1);
+
+	for (int i = 0; i < atlas_slices; i++) {
+		push_constant.atlas_slice = i;
+		rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(PushConstant));
+		rd->compute_list_dispatch(compute_list, group_size.x, group_size.y, group_size.z);
+	}
+	rd->compute_list_end();
+	rd->free_rid(compute_shader_seams);
+
+	return BAKE_OK;
+}
+
+// Adds the baked direct light (kept out of the denoiser) to the bounce light.
+LightmapperRD::BakeError LightmapperRD::_composite_direct(RenderingDevice *rd, Ref<RDShaderFile> &compute_shader, RID &compute_base_uniform_set, PushConstant &push_constant, RID &source_light_tex, RID &direct_light_tex, RID &dest_light_tex, const Size2i &atlas_size, int atlas_slices) {
+	Vector<RD::Uniform> uniforms = dilate_or_denoise_common_uniforms(source_light_tex, dest_light_tex);
+	{
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		u.binding = 2;
+		u.append_id(direct_light_tex);
+		uniforms.push_back(u);
+	}
+
+	RID compute_shader_composite = rd->shader_create_from_spirv(compute_shader->get_spirv_stages("composite_direct"));
+	ERR_FAIL_COND_V(compute_shader_composite.is_null(), BAKE_ERROR_LIGHTMAP_CANT_PRE_BAKE_MESHES); //internal check, should not happen
+	RID compute_shader_composite_pipeline = rd->compute_pipeline_create(compute_shader_composite);
+
+	RID composite_uniform_set = rd->uniform_set_create(uniforms, compute_shader_composite, 1);
+
+	RD::ComputeListID compute_list = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(compute_list, compute_shader_composite_pipeline);
+	rd->compute_list_bind_uniform_set(compute_list, compute_base_uniform_set, 0);
+	rd->compute_list_bind_uniform_set(compute_list, composite_uniform_set, 1);
+	push_constant.region_ofs[0] = 0;
+	push_constant.region_ofs[1] = 0;
+	Vector3i group_size(Math::division_round_up(atlas_size.x, 8), Math::division_round_up(atlas_size.y, 8), 1);
+
+	for (int i = 0; i < atlas_slices; i++) {
+		push_constant.atlas_slice = i;
+		rd->compute_list_set_push_constant(compute_list, &push_constant, sizeof(PushConstant));
+		rd->compute_list_dispatch(compute_list, group_size.x, group_size.y, group_size.z);
+	}
+	rd->compute_list_end();
+	rd->free_rid(compute_shader_composite);
+
+	return BAKE_OK;
+}
+
 Error LightmapperRD::_store_pfm(RenderingDevice *p_rd, RID p_atlas_tex, int p_index, const Size2i &p_atlas_size, const String &p_name, bool p_shadowmask) {
 	Vector<uint8_t> data = p_rd->texture_get_data(p_atlas_tex, p_index);
 	Ref<Image> img = Image::create_from_data(p_atlas_size.width, p_atlas_size.height, false, p_shadowmask ? Image::FORMAT_RGBA8 : Image::FORMAT_RGBAH, data);
@@ -1225,6 +1380,7 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 	RID light_dest_tex;
 	RID light_accum_tex;
 	RID light_accum_tex2;
+	RID light_direct_tex; // Baked direct light, kept out of the denoiser.
 	RID light_environment_tex;
 	RID area_light_atlas_tex;
 	RID shadowmask_tex;
@@ -1239,6 +1395,7 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 	rd->free_rid(light_source_tex); \
 	rd->free_rid(light_accum_tex2); \
 	rd->free_rid(light_accum_tex); \
+	rd->free_rid(light_direct_tex); \
 	rd->free_rid(light_environment_tex); \
 	rd->free_rid(area_light_atlas_tex); \
 	if (p_bake_shadowmask) { \
@@ -1303,6 +1460,8 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 		light_dest_tex = rd->texture_create(tf, RD::TextureView());
 		rd->texture_clear(light_dest_tex, Color(0, 0, 0, 0), 0, 1, 0, tf.array_layers);
 		light_accum_tex2 = light_dest_tex;
+		light_direct_tex = rd->texture_create(tf, RD::TextureView());
+		rd->texture_clear(light_direct_tex, Color(0, 0, 0, 0), 0, 1, 0, tf.array_layers);
 
 		//env
 		{
@@ -1905,6 +2064,14 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 				u.append_id(area_light_atlas_tex);
 				uniforms.push_back(u);
 			}
+
+			{
+				RD::Uniform u;
+				u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
+				u.binding = 7;
+				u.append_id(light_direct_tex);
+				uniforms.push_back(u);
+			}
 		}
 
 		RID light_uniform_set = rd->uniform_set_create(uniforms, compute_shader_primary, 1);
@@ -1973,6 +2140,20 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 		}
 	}
 #endif
+
+	// Debugging (see _debug_dir): direct light (L0 for SH lightmaps), shadowmask and texel sizes
+	// straight from the direct light pass.
+	for (int i = 0; i < atlas_slices; i++) {
+		_debug_save_texel_sizes(rd, position_tex, i, atlas_size, vformat("0_texel_size_%d", i));
+		// All direct light at each texel (every light, directly and through portals, as bounces use
+		// it), with world positions, for comparing values numerically.
+		_debug_save_raw(rd, position_tex, i, atlas_size, 16, vformat("0_position_%d", i));
+		_debug_save_raw(rd, light_source_tex, i, atlas_size, 8, vformat("1_direct_all_%d", i));
+		_debug_save_texture(rd, light_direct_tex, p_bake_sh ? i * 4 : i, atlas_size, Image::FORMAT_RGBAH, vformat("1_direct_%d", i));
+		if (p_bake_shadowmask) {
+			_debug_save_texture(rd, shadowmask_tex, i, atlas_size, Image::FORMAT_RGBA8, vformat("1_shadowmask_%d", i));
+		}
+	}
 
 	/* SECONDARY (indirect) LIGHT PASS(ES) */
 
@@ -2277,16 +2458,31 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 			}
 		}
 
+		// The shadowmask, like the direct light, isn't denoised: it's direct visibility, which isn't
+		// noisy, so static shadows stay as sharp as the rest of the baked direct light.
+	}
+
+	/* ADD DIRECT LIGHT */
+
+	{
+		SWAP(light_accum_tex, light_accum_tex2);
+		BakeError error = _composite_direct(rd, compute_shader, compute_base_uniform_set, push_constant, light_accum_tex2, light_direct_tex, light_accum_tex, atlas_size, atlas_slices);
+		if (unlikely(error != BAKE_OK)) {
+			return error;
+		}
+	}
+
+	/* PORTAL SEAMS */
+
+	if (!portals.is_empty()) {
+		SWAP(light_accum_tex, light_accum_tex2);
+		BakeError error = _portal_seams(rd, compute_shader, compute_base_uniform_set, push_constant, light_accum_tex2, position_tex, light_accum_tex, atlas_size, atlas_slices, p_bake_sh ? 4 : 1);
+		if (unlikely(error != BAKE_OK)) {
+			return error;
+		}
 		if (p_bake_shadowmask) {
-			BakeError error;
-			if (denoiser == 1) {
-				// OIDN (external).
-				error = _denoise_oidn(rd, shadowmask_tex, normal_tex, shadowmask_tex, atlas_size, atlas_slices, false, true, oidn_path);
-			} else {
-				// JNLM (built-in).
-				SWAP(shadowmask_tex, shadowmask_tex2);
-				error = _denoise(rd, compute_shader, compute_base_uniform_set, push_constant, shadowmask_tex2, normal_tex, shadowmask_tex, unocclude_tex, p_denoiser_strength, p_denoiser_range, atlas_size, atlas_slices, false, p_step_function, p_bake_userdata);
-			}
+			SWAP(shadowmask_tex, shadowmask_tex2);
+			error = _portal_seams(rd, compute_shader, compute_base_uniform_set, push_constant, shadowmask_tex2, position_tex, shadowmask_tex, atlas_size, atlas_slices, 1);
 			if (unlikely(error != BAKE_OK)) {
 				return error;
 			}
@@ -2480,6 +2676,14 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 
 	if (p_step_function) {
 		p_step_function(0.9, RTR("Retrieving textures"), p_bake_userdata, true);
+	}
+
+	// Debugging (see _debug_dir): the final light (L0 for SH lightmaps) and shadowmask.
+	for (int i = 0; i < atlas_slices; i++) {
+		_debug_save_texture(rd, light_accum_tex, p_bake_sh ? i * 4 : i, atlas_size, Image::FORMAT_RGBAH, vformat("2_final_light_%d", i));
+		if (p_bake_shadowmask) {
+			_debug_save_texture(rd, shadowmask_tex, i, atlas_size, Image::FORMAT_RGBA8, vformat("2_final_shadowmask_%d", i));
+		}
 	}
 
 	for (int i = 0; i < atlas_slices * (p_bake_sh ? 4 : 1); i++) {

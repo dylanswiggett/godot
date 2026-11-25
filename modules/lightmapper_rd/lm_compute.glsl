@@ -7,6 +7,8 @@ unocclude = "#define MODE_UNOCCLUDE";
 light_probes = "#define MODE_LIGHT_PROBES";
 denoise = "#define MODE_DENOISE";
 pack_coeffs = "#define MODE_PACK_L1_COEFFS";
+composite_direct = "#define MODE_COMPOSITE_DIRECT";
+portal_seams = "#define MODE_PORTAL_SEAMS";
 
 #[compute]
 
@@ -63,6 +65,12 @@ layout(rgba16f, set = 1, binding = 4) uniform restrict image2DArray accum_light;
 
 #endif
 
+#ifdef MODE_DIRECT_LIGHT
+// Baked direct light, kept apart from accum_light (which gets only bounce light) so it isn't
+// denoised; MODE_COMPOSITE_DIRECT adds it back after denoising.
+layout(rgba16f, set = 1, binding = 7) uniform restrict writeonly image2DArray direct_light;
+#endif
+
 #if defined(MODE_DIRECT_LIGHT) && defined(USE_SHADOWMASK)
 layout(rgba8, set = 1, binding = 5) uniform restrict writeonly image2DArray shadowmask;
 #elif defined(MODE_BOUNCE_LIGHT)
@@ -73,10 +81,19 @@ layout(set = 1, binding = 5) uniform texture2D environment;
 layout(set = 1, binding = 6) uniform texture2D area_light_atlas;
 #endif
 
-#if defined(MODE_DILATE) || defined(MODE_DENOISE) || defined(MODE_PACK_L1_COEFFS)
+#if defined(MODE_DILATE) || defined(MODE_DENOISE) || defined(MODE_PACK_L1_COEFFS) || defined(MODE_COMPOSITE_DIRECT) || defined(MODE_PORTAL_SEAMS)
 layout(rgba16f, set = 1, binding = 0) uniform restrict writeonly image2DArray dest_light;
 layout(set = 1, binding = 1) uniform texture2DArray source_light;
 #endif
+
+#ifdef MODE_COMPOSITE_DIRECT
+layout(set = 1, binding = 2) uniform texture2DArray direct_light;
+#endif
+
+#ifdef MODE_PORTAL_SEAMS
+layout(set = 1, binding = 2) uniform texture2DArray source_position;
+#endif
+
 
 #ifdef MODE_DENOISE
 layout(set = 1, binding = 2) uniform texture2DArray source_normal;
@@ -349,6 +366,11 @@ uint trace_ray_any_hit(vec3 p_from, vec3 p_to) {
 	return trace_ray(p_from, p_to, true, distance, normal, triangle, barycentric);
 }
 
+// How far outside a portal's rectangle a crossing still counts as going through it. Surfaces often
+// run exactly along an opening's edges (e.g. a floor at a doorway portal's bottom edge), so rays
+// from them cross right on the edge, where rounding would otherwise decide.
+const float PORTAL_EDGE_TOLERANCE = 0.01;
+
 // The first portal (nearest p_from) the segment from p_from to p_to goes into (from in front of
 // its entrance to behind it, through its rectangle), or -1. r_t is how far along the segment.
 int find_portal_crossing(vec3 p_from, vec3 p_to, out float r_t) {
@@ -366,7 +388,7 @@ int find_portal_crossing(vec3 p_from, vec3 p_to, out float r_t) {
 			continue;
 		}
 		vec3 hit = mix(p_from, p_to, t) - portal.center;
-		if (abs(dot(hit, portal.right)) <= portal.half_width && abs(dot(hit, portal.up)) <= portal.half_height) {
+		if (abs(dot(hit, portal.right)) <= portal.half_width + PORTAL_EDGE_TOLERANCE && abs(dot(hit, portal.up)) <= portal.half_height + PORTAL_EDGE_TOLERANCE) {
 			found = int(i);
 			r_t = t;
 		}
@@ -374,39 +396,69 @@ int find_portal_crossing(vec3 p_from, vec3 p_to, out float r_t) {
 	return found;
 }
 
-// A shadow ray from p_from to p_to, for light arriving along the path through portal p_portal (or
-// -1 for the direct path), in the space in front of that portal's entrance. The path must go into
-// exactly that portal first (the direct path into none: light from whatever is physically behind
-// a portal doesn't come through it), and then reach the light from the exit unblocked, through no
-// further portals. Otherwise the result is an opaque hit. Hits past the portal count as opaque, so
-// callers never continue from them (their position is in the exit's space).
-uint trace_shadow_ray(vec3 p_from, vec3 p_to, int p_portal, out vec4 r_albedo_alpha, out vec3 r_hit_position) {
+// p_sample (a point near p_position, e.g. an anti-aliasing sample within its texel), moved back onto
+// p_position's side of any portal opening between them, so texels at an opening don't average
+// light from both sides of it.
+vec3 keep_portal_side(vec3 p_position, vec3 p_sample) {
+	for (uint i = 0; i < bake_params.portal_count; i++) {
+		Portal portal = portals.data[i];
+		float position_side = dot(p_position - portal.center, portal.front);
+		float sample_side = dot(p_sample - portal.center, portal.front);
+		if ((position_side >= 0.0) == (sample_side >= 0.0)) {
+			continue;
+		}
+		vec3 crossing = mix(p_position, p_sample, position_side / (position_side - sample_side)) - portal.center;
+		if (abs(dot(crossing, portal.right)) > portal.half_width + PORTAL_EDGE_TOLERANCE || abs(dot(crossing, portal.up)) > portal.half_height + PORTAL_EDGE_TOLERANCE) {
+			continue;
+		}
+		p_sample += portal.front * ((position_side >= 0.0 ? 1e-4 : -1e-4) - sample_side);
+	}
+	return p_sample;
+}
+
+// A shadow ray from p_origin to p_to, for light arriving along the path through portal p_portal
+// (or -1 for the direct path), in the space in front of that portal's entrance. The path must go
+// into exactly that portal first (the direct path into none: light from whatever is physically
+// behind a portal doesn't come through it), and then reach the light from the exit unblocked,
+// through no further portals. Otherwise the result is an opaque hit. Hits past the portal count as
+// opaque, so callers never continue from them (their position is in the exit's space).
+//
+// Geometry is traced from p_offset along the ray (so surfaces don't shadow themselves), but which
+// portal the ray goes through is decided from p_origin: near a portal's plane, the offset alone
+// could carry the start past the plane.
+uint trace_shadow_ray(vec3 p_origin, float p_offset, vec3 p_to, int p_portal, out vec4 r_albedo_alpha, out vec3 r_hit_position) {
 	float t;
-	int crossed = find_portal_crossing(p_from, p_to, t);
+	int crossed = find_portal_crossing(p_origin, p_to, t);
 	if (crossed != p_portal) {
 		r_albedo_alpha = vec4(0.0, 0.0, 0.0, 1.0);
-		r_hit_position = p_from;
+		r_hit_position = p_origin;
 		return RAY_FRONT;
 	}
+	vec3 dir = normalize(p_to - p_origin);
+	vec3 from = p_origin + dir * p_offset;
 	if (p_portal < 0) {
-		return trace_ray_closest_hit_triangle_albedo_alpha(p_from, p_to, r_albedo_alpha, r_hit_position);
+		return trace_ray_closest_hit_triangle_albedo_alpha(from, p_to, r_albedo_alpha, r_hit_position);
 	}
 
-	vec3 crossing = mix(p_from, p_to, t);
-	uint ret = trace_ray_closest_hit_triangle_albedo_alpha(p_from, crossing, r_albedo_alpha, r_hit_position);
-	if (ret != RAY_MISS) {
-		return ret;
+	// Up to the portal (if the offset start isn't already past it), then on from the exit.
+	vec3 crossing = mix(p_origin, p_to, t);
+	if (distance(p_origin, crossing) > p_offset) {
+		uint ret = trace_ray_closest_hit_triangle_albedo_alpha(from, crossing, r_albedo_alpha, r_hit_position);
+		if (ret != RAY_MISS) {
+			return ret;
+		}
+		from = crossing;
 	}
 	mat4 transfer = portals.data[p_portal].transfer;
-	vec3 from = (transfer * vec4(crossing, 1.0)).xyz;
-	vec3 to = (transfer * vec4(p_to, 1.0)).xyz;
+	vec3 exit_from = (transfer * vec4(from, 1.0)).xyz;
+	vec3 exit_to = (transfer * vec4(p_to, 1.0)).xyz;
 	float further_t;
-	if (find_portal_crossing(from, to, further_t) >= 0) {
+	if (find_portal_crossing(exit_from, exit_to, further_t) >= 0) {
 		r_albedo_alpha = vec4(0.0, 0.0, 0.0, 1.0);
-		r_hit_position = p_from;
+		r_hit_position = p_origin;
 		return RAY_FRONT;
 	}
-	ret = trace_ray_closest_hit_triangle_albedo_alpha(from, to, r_albedo_alpha, r_hit_position);
+	uint ret = trace_ray_closest_hit_triangle_albedo_alpha(exit_from, exit_to, r_albedo_alpha, r_hit_position);
 	r_albedo_alpha.a = 1.0;
 	return ret;
 }
@@ -633,7 +685,7 @@ void trace_direct_light(vec3 p_position, vec3 p_normal, uint p_light_index, int 
 			vec2 disk_sample = (halton_map[i] - vec2(0.5)) * p_texel_size * light_data.shadow_blur;
 			// Align the sample to world space.
 			vec3 disk_aligned = (disk_sample.x * tangent + disk_sample.y * bitan);
-			vec3 origin = p_position - disk_aligned;
+			vec3 origin = keep_portal_side(p_position, p_position - disk_aligned);
 			vec3 light_dir = normalize(light_pos - origin);
 
 			float power = 0.0;
@@ -671,7 +723,7 @@ void trace_direct_light(vec3 p_position, vec3 p_normal, uint p_light_index, int 
 						vec4 hit_albedo = vec4(1.0);
 						vec3 hit_position;
 						// Offset the ray origin for AA, offset the light position for soft shadows.
-						uint ret = trace_shadow_ray(origin - light_disk_to_point * (bake_params.bias + length(disk_sample)), p_position - light_disk_to_point * dist, p_portal, hit_albedo, hit_position);
+						uint ret = trace_shadow_ray(origin, bake_params.bias + length(disk_sample), p_position - light_disk_to_point * dist, p_portal, hit_albedo, hit_position);
 						if (ret == RAY_MISS) {
 							if (!sample_did_hit) {
 								sample_penumbra = 1.0;
@@ -712,7 +764,7 @@ void trace_direct_light(vec3 p_position, vec3 p_normal, uint p_light_index, int 
 					vec4 hit_albedo = vec4(1.0);
 					vec3 hit_position;
 					// Offset the ray origin for AA, offset the light position for soft shadows.
-					uint ret = trace_shadow_ray(origin + light_dir * (bake_params.bias + length(disk_sample)), light_pos, p_portal, hit_albedo, hit_position);
+					uint ret = trace_shadow_ray(origin, bake_params.bias + length(disk_sample), light_pos, p_portal, hit_albedo, hit_position);
 					if (ret == RAY_MISS) {
 						if (!sample_did_hit) {
 							sample_penumbra = 1.0;
@@ -752,7 +804,7 @@ void trace_direct_light(vec3 p_position, vec3 p_normal, uint p_light_index, int 
 		for (uint iter = 0; iter < bake_params.transparency_rays; iter++) {
 			vec4 hit_albedo = vec4(1.0);
 			vec3 hit_position;
-			uint ret = trace_shadow_ray(p_position + shadow_dir * bake_params.bias, light_pos, p_portal, hit_albedo, hit_position);
+			uint ret = trace_shadow_ray(p_position, bake_params.bias, light_pos, p_portal, hit_albedo, hit_position);
 			if (ret == RAY_MISS) {
 				if (!did_hit) {
 					penumbra = 1.0;
@@ -814,13 +866,17 @@ vec3 trace_indirect_light(vec3 p_position, vec3 p_ray_dir, inout uint r_noise, f
 		vec3 barycentric;
 		vec3 ray_from = position + ray_dir * bake_params.bias;
 		vec3 ray_to = position + ray_dir * length(bake_params.world_size);
-		// Only trace up to a portal: what's behind its entrance isn't on the ray's path.
+		// Only trace up to a portal: what's behind its entrance isn't on the ray's path. Which portal
+		// is decided from the point itself (the bias alone could carry ray_from past a portal's plane).
 		float portal_t;
-		int portal = find_portal_crossing(ray_from, ray_to, portal_t);
+		int portal = find_portal_crossing(position, ray_to, portal_t);
 		if (portal >= 0) {
-			ray_to = mix(ray_from, ray_to, portal_t);
+			ray_to = mix(position, ray_to, portal_t);
+			if (dot(ray_to - ray_from, ray_dir) <= 0.0) {
+				ray_from = ray_to; // Already at the portal.
+			}
 		}
-		uint trace_result = trace_ray_closest_hit_triangle(ray_from, ray_to, tidx, barycentric);
+		uint trace_result = distance(ray_from, ray_to) > 0.0 ? trace_ray_closest_hit_triangle(ray_from, ray_to, tidx, barycentric) : RAY_MISS;
 		if (trace_result == RAY_MISS && portal >= 0) {
 			// Continue out of the portal's exit (not a bounce).
 			if (portal_hops_left == 0) {
@@ -1071,15 +1127,17 @@ void main() {
 	light_for_bounces *= bake_params.exposure_normalization;
 	imageStore(dest_light, ivec3(atlas_pos, params.atlas_slice), vec4(light_for_bounces, 1.0));
 
+	// Direct light is kept apart, to be added after denoising (it isn't noisy). accum_light starts
+	// empty for the bounces; its alpha marks the texel as used.
 #ifdef USE_SH_LIGHTMAPS
-	// Keep for adding at the end.
-	imageStore(accum_light, ivec3(atlas_pos, params.atlas_slice * 4 + 0), sh_accum[0]);
-	imageStore(accum_light, ivec3(atlas_pos, params.atlas_slice * 4 + 1), sh_accum[1]);
-	imageStore(accum_light, ivec3(atlas_pos, params.atlas_slice * 4 + 2), sh_accum[2]);
-	imageStore(accum_light, ivec3(atlas_pos, params.atlas_slice * 4 + 3), sh_accum[3]);
+	for (int i = 0; i < 4; i++) {
+		imageStore(direct_light, ivec3(atlas_pos, params.atlas_slice * 4 + i), sh_accum[i]);
+		imageStore(accum_light, ivec3(atlas_pos, params.atlas_slice * 4 + i), vec4(0.0, 0.0, 0.0, 1.0));
+	}
 #else
 	light_for_texture *= bake_params.exposure_normalization;
-	imageStore(accum_light, ivec3(atlas_pos, params.atlas_slice), vec4(light_for_texture, 1.0));
+	imageStore(direct_light, ivec3(atlas_pos, params.atlas_slice), vec4(light_for_texture, 1.0));
+	imageStore(accum_light, ivec3(atlas_pos, params.atlas_slice), vec4(0.0, 0.0, 0.0, 1.0));
 #endif
 
 #ifdef USE_SHADOWMASK
@@ -1440,6 +1498,96 @@ void main() {
 		}
 
 		imageStore(dest_light, ivec3(atlas_pos, lightmap_slice), vec4(denoised_rgb, input_light.a));
+	}
+#endif
+
+#ifdef MODE_COMPOSITE_DIRECT
+	// Adds the (undenoised) direct light to the denoised bounce light.
+#ifdef USE_SH_LIGHTMAPS
+	// The bounce light's L1 coefficients are already packed relative to its L0 (see
+	// MODE_PACK_L1_COEFFS): unpack them, add the direct light's, and pack relative to the sum.
+	vec4 base_coeff = texelFetch(sampler2DArray(source_light, linear_sampler), ivec3(atlas_pos, params.atlas_slice * 4), 0);
+	vec4 direct_base = texelFetch(sampler2DArray(direct_light, linear_sampler), ivec3(atlas_pos, params.atlas_slice * 4), 0);
+	vec4 total_base = vec4(base_coeff.rgb + direct_base.rgb, base_coeff.a);
+	imageStore(dest_light, ivec3(atlas_pos, params.atlas_slice * 4), total_base);
+
+	for (int i = 1; i < 4; i++) {
+		vec4 c = texelFetch(sampler2DArray(source_light, linear_sampler), ivec3(atlas_pos, params.atlas_slice * 4 + i), 0);
+		vec3 bounce = (c.rgb - vec3(0.5)) * (base_coeff.rgb * 8.0 + vec3(1e-6f));
+		vec3 direct = texelFetch(sampler2DArray(direct_light, linear_sampler), ivec3(atlas_pos, params.atlas_slice * 4 + i), 0).rgb;
+		c.rgb = clamp((bounce + direct) / (total_base.rgb * 8.0 + vec3(1e-6f)) + vec3(0.5), vec3(0.0), vec3(1.0));
+		imageStore(dest_light, ivec3(atlas_pos, params.atlas_slice * 4 + i), c);
+	}
+#else
+	vec4 c = texelFetch(sampler2DArray(source_light, linear_sampler), ivec3(atlas_pos, params.atlas_slice), 0);
+	c.rgb += texelFetch(sampler2DArray(direct_light, linear_sampler), ivec3(atlas_pos, params.atlas_slice), 0).rgb;
+	imageStore(dest_light, ivec3(atlas_pos, params.atlas_slice), c);
+#endif
+#endif
+
+#ifdef MODE_PORTAL_SEAMS
+	// Texels just behind a portal's entrance, within its opening, take the values of the nearest
+	// texel in front of it on the same surface. A surface continuing through an opening is lit as
+	// two different places on either side of it; without this, filtering the lightmap at runtime
+	// would blend light from behind the portal into the edge in front of it. (Copying keeps the
+	// light up to the edge on the same footing as in front of it: lighting these texels as the
+	// place they continue into instead would mix real-time and baked light within the filter at
+	// the edge, for real-time lights.) params.ray_count is the number of layers per atlas slice
+	// (4 for SH lightmaps).
+	const int max_radius = 3;
+	uint layers = params.ray_count;
+	ivec2 atlas_dims = textureSize(source_position, 0).xy;
+	vec4 position = texelFetch(sampler2DArray(source_position, linear_sampler), ivec3(atlas_pos, params.atlas_slice), 0);
+	ivec2 source_pos = atlas_pos;
+	if (position.w >= 0.001) {
+		// World size of a texel (to its nearest used neighbor), to tell neighbors on the same
+		// surface from other charts nearby in the atlas.
+		float texel_size = 1e20;
+		const ivec2 offsets[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+		for (int i = 0; i < 4; i++) {
+			ivec2 p = atlas_pos + offsets[i];
+			if (all(greaterThanEqual(p, ivec2(0))) && all(lessThan(p, atlas_dims))) {
+				vec4 n = texelFetch(sampler2DArray(source_position, linear_sampler), ivec3(p, params.atlas_slice), 0);
+				if (n.w >= 0.001) {
+					texel_size = min(texel_size, distance(n.xyz, position.xyz));
+				}
+			}
+		}
+		float max_distance = texel_size < 1e19 ? (float(max_radius) + 1.0) * 1.5 * texel_size : 0.0;
+
+		for (uint i = 0; i < bake_params.portal_count && source_pos == atlas_pos; i++) {
+			Portal portal = portals.data[i];
+			float side = dot(position.xyz - portal.center, portal.front);
+			if (side >= 0.0) {
+				continue;
+			}
+			vec3 on_plane = position.xyz - portal.front * side - portal.center;
+			if (abs(dot(on_plane, portal.right)) > portal.half_width + PORTAL_EDGE_TOLERANCE || abs(dot(on_plane, portal.up)) > portal.half_height + PORTAL_EDGE_TOLERANCE) {
+				continue;
+			}
+			float best = 1e20;
+			for (int y = -max_radius; y <= max_radius; y++) {
+				for (int x = -max_radius; x <= max_radius; x++) {
+					ivec2 p = atlas_pos + ivec2(x, y);
+					if (any(lessThan(p, ivec2(0))) || any(greaterThanEqual(p, atlas_dims))) {
+						continue;
+					}
+					vec4 n = texelFetch(sampler2DArray(source_position, linear_sampler), ivec3(p, params.atlas_slice), 0);
+					if (n.w < 0.001 || dot(n.xyz - portal.center, portal.front) < 0.0 || distance(n.xyz, position.xyz) > max_distance) {
+						continue;
+					}
+					float d = float(x * x + y * y);
+					if (d < best) {
+						best = d;
+						source_pos = p;
+					}
+				}
+			}
+		}
+	}
+	for (uint l = 0; l < layers; l++) {
+		vec4 c = texelFetch(sampler2DArray(source_light, linear_sampler), ivec3(source_pos, params.atlas_slice * layers + l), 0);
+		imageStore(dest_light, ivec3(atlas_pos, params.atlas_slice * layers + l), c);
 	}
 #endif
 
