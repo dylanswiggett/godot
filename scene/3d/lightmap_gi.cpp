@@ -879,12 +879,7 @@ LightmapGI::BakeError LightmapGI::_save_and_reimport_atlas_textures(const Ref<Li
 
 		config->set_value("remap", "importer", "2d_array_texture");
 		config->set_value("remap", "type", "CompressedTexture2DArray");
-		if (p_is_shadowmask) {
-			// Lossless: compression error would make the shadowmask disagree with the lightmap's
-			// (lossless) direct light at shadow edges, and games may use it to take dynamic
-			// shadows out of the baked light.
-			config->set_value("params", "compress/mode", 0);
-		} else if (!config->has_section_key("params", "compress/mode")) {
+		if (!config->has_section_key("params", "compress/mode")) {
 			// Do not override an existing compression mode.
 			config->set_value("params", "compress/mode", 2);
 		}

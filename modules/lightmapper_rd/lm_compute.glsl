@@ -1121,10 +1121,7 @@ void main() {
 	vec3 light_for_bounces = vec3(0.0);
 
 #ifdef USE_SHADOWMASK
-	// The shadowmask light's visibility per path: R directly, G through portal 0, B through portal
-	// 1 (Godot's renderer only uses R; the game uses the others for dynamic shadows through
-	// portals).
-	vec3 shadowmask_value = vec3(0.0f);
+	float shadowmask_value = 0.0f;
 #endif
 
 #ifdef USE_SH_LIGHTMAPS
@@ -1139,7 +1136,7 @@ void main() {
 	uint noise = random_seed(ivec3(atlas_pos, 43573547));
 	// Each light directly, then through each portal. Light through portals is always baked into the
 	// texture, even from lights that are otherwise real-time: they can't shine through portals at
-	// runtime.
+	// runtime. The shadowmask is only about the direct path.
 	for (uint light_portal = 0; light_portal < bake_params.light_count * (bake_params.portal_count + 1); light_portal++) {
 		uint i = light_portal / (bake_params.portal_count + 1);
 		int portal = int(light_portal % (bake_params.portal_count + 1)) - 1;
@@ -1189,8 +1186,8 @@ void main() {
 		light_for_bounces += light * lights.data[i].indirect_energy;
 
 #ifdef USE_SHADOWMASK
-		if (lights.data[i].type == LIGHT_TYPE_DIRECTIONAL && i == bake_params.shadowmask_light_idx && portal < 2) {
-			shadowmask_value[portal + 1] = max(shadowmask_value[portal + 1], shadow);
+		if (lights.data[i].type == LIGHT_TYPE_DIRECTIONAL && i == bake_params.shadowmask_light_idx && portal < 0) {
+			shadowmask_value = max(shadowmask_value, shadow);
 		}
 #endif
 	}
@@ -1212,7 +1209,7 @@ void main() {
 #endif
 
 #ifdef USE_SHADOWMASK
-	imageStore(shadowmask, ivec3(atlas_pos, params.atlas_slice), vec4(shadowmask_value, 1.0));
+	imageStore(shadowmask, ivec3(atlas_pos, params.atlas_slice), vec4(shadowmask_value, shadowmask_value, shadowmask_value, 1.0));
 #endif
 
 #endif // MODE_DIRECT_LIGHT
