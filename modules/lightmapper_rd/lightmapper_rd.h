@@ -357,10 +357,12 @@ class LightmapperRD : public Lightmapper {
 		uint32_t texel = 0;
 		uint32_t first_tap = 0;
 		uint32_t tap_count = 0;
+		int32_t portal = -1; // The portal the texel is behind.
+		int32_t reverse_portal = -1; // The portal from its exit back to its entrance, or -1.
 	};
 
 	void _find_portal_fills(RenderingDevice *p_rd, RID p_position_tex, RID p_normal_tex, const Size2i &p_atlas_size, int p_atlas_slices, LocalVector<PortalFill> &r_fills, LocalVector<PortalFillTap> &r_taps, int &r_unfilled);
-	void _apply_portal_fills(RenderingDevice *p_rd, RID p_tex, int p_layers_per_slice, bool p_half_float, const LocalVector<PortalFill> &p_fills, const LocalVector<PortalFillTap> &p_taps, const Size2i &p_atlas_size, int p_atlas_slices);
+	void _apply_portal_fills(RenderingDevice *p_rd, RID p_tex, int p_layers_per_slice, bool p_shadowmask, const LocalVector<PortalFill> &p_fills, const LocalVector<PortalFillTap> &p_taps, const Size2i &p_atlas_size, int p_atlas_slices);
 
 	LocalVector<DenoisePortalPair> _find_denoise_portal_pairs(RenderingDevice *p_rd, RID p_position_tex, RID p_normal_tex, const Size2i &p_atlas_size, int p_atlas_slices, int p_denoiser_range);
 

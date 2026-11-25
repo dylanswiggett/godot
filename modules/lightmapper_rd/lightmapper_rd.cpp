@@ -1588,8 +1588,16 @@ void LightmapperRD::_find_portal_fills(RenderingDevice *p_rd, RID p_position_tex
 		Vector3 exit_center, exit_front, exit_right, exit_up;
 	};
 	LocalVector<PortalFrame> frames;
+	LocalVector<int32_t> reverse_portals;
 	const Basis half_turn(Vector3(0, 1, 0), Math::PI);
 	for (const Portal &portal : portals) {
+		int32_t reverse = -1;
+		for (int j = 0; j < portals.size(); j++) {
+			if (portals[j].entrance.origin.is_equal_approx(portal.exit.origin) && portals[j].exit.origin.is_equal_approx(portal.entrance.origin)) {
+				reverse = j;
+			}
+		}
+		reverse_portals.push_back(reverse);
 		PortalFrame f;
 		const Basis &basis = portal.entrance.basis;
 		f.center = portal.entrance.origin;
@@ -1708,6 +1716,8 @@ void LightmapperRD::_find_portal_fills(RenderingDevice *p_rd, RID p_position_tex
 					fill.texel = uint32_t((s * h + y) * w + x);
 					fill.first_tap = first_tap;
 					fill.tap_count = r_taps.size() - first_tap;
+					fill.portal = i;
+					fill.reverse_portal = reverse_portals[i];
 					r_fills.push_back(fill);
 					break;
 				}
@@ -1717,8 +1727,12 @@ void LightmapperRD::_find_portal_fills(RenderingDevice *p_rd, RID p_position_tex
 }
 
 // Copies the light (or shadowmask) found by _find_portal_fills into the texels behind portal
-// openings.
-void LightmapperRD::_apply_portal_fills(RenderingDevice *p_rd, RID p_tex, int p_layers_per_slice, bool p_half_float, const LocalVector<PortalFill> &p_fills, const LocalVector<PortalFillTap> &p_taps, const Size2i &p_atlas_size, int p_atlas_slices) {
+// openings. The shadowmask's paths (R directly, G and B through portals 0 and 1) are remapped to
+// how light continues across the opening: what reaches the continuation directly reaches this
+// side through the reverse portal (it would have gone into the exit), and what reaches it through
+// this portal reaches this side directly (it hadn't gone in yet).
+void LightmapperRD::_apply_portal_fills(RenderingDevice *p_rd, RID p_tex, int p_layers_per_slice, bool p_shadowmask, const LocalVector<PortalFill> &p_fills, const LocalVector<PortalFillTap> &p_taps, const Size2i &p_atlas_size, int p_atlas_slices) {
+	const bool half_float = !p_shadowmask; // The light is RGBA16F, the shadowmask RGBA8.
 	if (p_fills.is_empty()) {
 		return;
 	}
@@ -1731,7 +1745,7 @@ void LightmapperRD::_apply_portal_fills(RenderingDevice *p_rd, RID p_tex, int p_
 		auto read = [&](uint32_t p_texel) -> Color {
 			const uint8_t *data = source[p_texel / texels_per_slice].ptr();
 			uint32_t i = p_texel % texels_per_slice;
-			if (p_half_float) {
+			if (half_float) {
 				const uint16_t *c = reinterpret_cast<const uint16_t *>(data) + i * 4;
 				return Color(Math::half_to_float(c[0]), Math::half_to_float(c[1]), Math::half_to_float(c[2]), Math::half_to_float(c[3]));
 			}
@@ -1750,9 +1764,19 @@ void LightmapperRD::_apply_portal_fills(RenderingDevice *p_rd, RID p_tex, int p_
 				weight_sum += p_taps[t].weight;
 			}
 			Color c = sum / weight_sum;
+			if (p_shadowmask) {
+				Color paths = Color(0, 0, 0, c.a);
+				if (fill.portal >= 0 && fill.portal < 2) {
+					paths.components[0] = c.components[1 + fill.portal];
+				}
+				if (fill.reverse_portal >= 0 && fill.reverse_portal < 2) {
+					paths.components[1 + fill.reverse_portal] = c.components[0];
+				}
+				c = paths;
+			}
 			uint8_t *data = dest[fill.texel / texels_per_slice].ptrw();
 			uint32_t i = fill.texel % texels_per_slice;
-			if (p_half_float) {
+			if (half_float) {
 				uint16_t *out = reinterpret_cast<uint16_t *>(data) + i * 4;
 				for (int k = 0; k < 4; k++) {
 					out[k] = Math::make_half_float(c.components[k]);
@@ -3137,9 +3161,9 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 		int unfilled = 0;
 		_find_portal_fills(rd, position_tex, normal_tex, atlas_size, atlas_slices, fills, taps, unfilled);
 		print_line(vformat("LightmapperRD: %d texels behind portal openings filled with the light where they continue through the portals (%d with nothing found there).", fills.size(), unfilled));
-		_apply_portal_fills(rd, light_accum_tex, p_bake_sh ? 4 : 1, true, fills, taps, atlas_size, atlas_slices);
+		_apply_portal_fills(rd, light_accum_tex, p_bake_sh ? 4 : 1, false, fills, taps, atlas_size, atlas_slices);
 		if (p_bake_shadowmask) {
-			_apply_portal_fills(rd, shadowmask_tex, 1, false, fills, taps, atlas_size, atlas_slices);
+			_apply_portal_fills(rd, shadowmask_tex, 1, true, fills, taps, atlas_size, atlas_slices);
 		}
 	}
 
