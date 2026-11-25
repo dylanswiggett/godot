@@ -1374,6 +1374,45 @@ void main() {
 		for (uint j = 0; j < 9; j++) { //accum from existing
 			probe_sh_accum[j] *= 4.0 / float(params.ray_count);
 		}
+
+		if (bake_params.probe_direct_light != 0) {
+			// Direct light from each light that's baked (static lights, and any light through
+			// portals), as light arriving from its direction: in the same units as the rays above
+			// (radiance projected onto SH, divided by PI), a light whose lightmap value at full N.L
+			// would be E contributes E * Y(direction). Visibility is traced like the lightmap's, so
+			// probes in a light's (soft) shadow get correspondingly less.
+			for (uint light_portal = 0; light_portal < bake_params.light_count * (bake_params.portal_count + 1); light_portal++) {
+				uint i = light_portal / (bake_params.portal_count + 1);
+				int portal = int(light_portal % (bake_params.portal_count + 1)) - 1;
+				if (!lights.data[i].static_bake && portal < 0) {
+					continue;
+				}
+				vec3 light;
+				vec3 light_dir;
+				float shadow;
+				// Once for the light's direction (from here, possibly through the portal), then
+				// facing it, so N.L doesn't reduce it.
+				trace_direct_light(position, vec3(0.0, 1.0, 0.0), i, portal, true, light, light_dir, noise, 0.0, shadow);
+				if (dot(light_dir, light_dir) < 0.5) {
+					continue;
+				}
+				trace_direct_light(position, light_dir, i, portal, true, light, light_dir, noise, 0.0, shadow);
+				float c[9] = float[](
+						0.282095, //l0
+						0.488603 * light_dir.y, //l1n1
+						0.488603 * light_dir.z, //l1n0
+						0.488603 * light_dir.x, //l1p1
+						1.092548 * light_dir.x * light_dir.y, //l2n2
+						1.092548 * light_dir.y * light_dir.z, //l2n1
+						0.315392 * (3.0 * light_dir.z * light_dir.z - 1.0), //l20
+						1.092548 * light_dir.x * light_dir.z, //l2p1
+						0.546274 * (light_dir.x * light_dir.x - light_dir.y * light_dir.y) //l2p2
+				);
+				for (uint j = 0; j < 9; j++) {
+					probe_sh_accum[j].rgb += light * bake_params.exposure_normalization * c[j];
+				}
+			}
+		}
 	}
 
 	for (uint j = 0; j < 9; j++) { //accum from existing

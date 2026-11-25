@@ -65,6 +65,11 @@ void initialize_lightmapper_rd_module(ModuleInitializationLevel p_level) {
 	// Off keeps direct light out of the denoiser, so shadows from small lights stay sharp; on
 	// denoises it with the bounces, for soft lights (large lights and suns) whose penumbrae are noisy.
 	GLOBAL_DEF("rendering/lightmapping/denoising/denoise_direct_light", true);
+	// Bakes static lights' direct light (and all light through portals) into light probes too, so
+	// dynamic objects can be lit by probes alone (with static lights' cull masks excluding them):
+	// otherwise probes only hold indirect light, and static lights light dynamic objects in real
+	// time.
+	GLOBAL_DEF("rendering/lightmapping/probes/include_direct_light", false);
 #ifndef _3D_DISABLED
 	GDREGISTER_CLASS(LightmapperRD);
 	Lightmapper::create_gpu = create_lightmapper_rd;

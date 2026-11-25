@@ -61,7 +61,8 @@ class LightmapperRD : public Lightmapper {
 		float supersampling_factor = 0.0f;
 
 		uint32_t portal_count = 0;
-		uint32_t pad[3] = {};
+		uint32_t probe_direct_light = 0; // See rendering/lightmapping/probes/include_direct_light.
+		uint32_t pad[2] = {};
 	};
 
 	// A portal on the GPU (see Portal): the entrance's rectangle (unit axes and half sizes), and

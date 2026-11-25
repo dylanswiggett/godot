@@ -2255,6 +2255,7 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 	bake_parameters.transparency_rays = GLOBAL_GET("rendering/lightmapping/bake_performance/max_transparency_rays");
 	bake_parameters.supersampling_factor = p_supersampling_factor;
 	bake_parameters.portal_count = portals.size();
+	bake_parameters.probe_direct_light = bool(GLOBAL_GET("rendering/lightmapping/probes/include_direct_light"));
 
 	bake_parameters_buffer = rd->uniform_buffer_create(sizeof(BakeParameters));
 	rd->buffer_update(bake_parameters_buffer, 0, sizeof(BakeParameters), &bake_parameters);

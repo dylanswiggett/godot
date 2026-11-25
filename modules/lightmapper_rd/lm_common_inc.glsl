@@ -21,7 +21,7 @@ layout(set = 0, binding = 0) uniform BakeParameters {
 	float supersampling_factor;
 
 	uint portal_count;
-	uint pad_portal0;
+	uint probe_direct_light; // See rendering/lightmapping/probes/include_direct_light.
 	uint pad_portal1;
 	uint pad_portal2;
 }
