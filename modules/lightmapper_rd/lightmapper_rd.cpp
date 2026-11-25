@@ -1919,11 +1919,12 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 		return bake_error;
 	}
 
-	// Find any directional light suitable for shadowmasking.
+	// Find any directional light suitable for shadowmasking (a static one will do: see the
+	// shadowmask light's selection below).
 	if (p_bake_shadowmask) {
 		bool found = false;
 		for (int i = 0; i < lights.size(); i++) {
-			if (lights[i].type == LightType::LIGHT_TYPE_DIRECTIONAL && !lights[i].static_bake) {
+			if (lights[i].type == LightType::LIGHT_TYPE_DIRECTIONAL) {
 				found = true;
 				break;
 			}
@@ -1931,7 +1932,7 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 
 		if (!found) {
 			p_bake_shadowmask = false;
-			WARN_PRINT("Shadowmask disabled: no directional light with their bake mode set to dynamic exists.");
+			WARN_PRINT("Shadowmask disabled: no directional light exists.");
 		}
 	}
 
