@@ -993,13 +993,20 @@ static void _debug_save_texel_sizes(RenderingDevice *p_rd, RID p_position_tex, i
 
 // Texels just behind a portal's opening take the values of the nearest texel in front of it on the
 // same surface (see MODE_PORTAL_SEAMS), for a light or shadowmask texture.
-LightmapperRD::BakeError LightmapperRD::_portal_seams(RenderingDevice *rd, Ref<RDShaderFile> &compute_shader, RID &compute_base_uniform_set, PushConstant &push_constant, RID &source_tex, RID &position_tex, RID &dest_tex, const Size2i &atlas_size, int atlas_slices, int layers_per_slice) {
+LightmapperRD::BakeError LightmapperRD::_portal_seams(RenderingDevice *rd, Ref<RDShaderFile> &compute_shader, RID &compute_base_uniform_set, PushConstant &push_constant, RID &source_tex, RID &position_tex, RID &normal_tex, RID &dest_tex, const Size2i &atlas_size, int atlas_slices, int layers_per_slice) {
 	Vector<RD::Uniform> uniforms = dilate_or_denoise_common_uniforms(source_tex, dest_tex);
 	{
 		RD::Uniform u;
 		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
 		u.binding = 2;
 		u.append_id(position_tex);
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		u.binding = 3;
+		u.append_id(normal_tex);
 		uniforms.push_back(u);
 	}
 
@@ -2476,13 +2483,13 @@ LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_d
 
 	if (!portals.is_empty()) {
 		SWAP(light_accum_tex, light_accum_tex2);
-		BakeError error = _portal_seams(rd, compute_shader, compute_base_uniform_set, push_constant, light_accum_tex2, position_tex, light_accum_tex, atlas_size, atlas_slices, p_bake_sh ? 4 : 1);
+		BakeError error = _portal_seams(rd, compute_shader, compute_base_uniform_set, push_constant, light_accum_tex2, position_tex, normal_tex, light_accum_tex, atlas_size, atlas_slices, p_bake_sh ? 4 : 1);
 		if (unlikely(error != BAKE_OK)) {
 			return error;
 		}
 		if (p_bake_shadowmask) {
 			SWAP(shadowmask_tex, shadowmask_tex2);
-			error = _portal_seams(rd, compute_shader, compute_base_uniform_set, push_constant, shadowmask_tex2, position_tex, shadowmask_tex, atlas_size, atlas_slices, 1);
+			error = _portal_seams(rd, compute_shader, compute_base_uniform_set, push_constant, shadowmask_tex2, position_tex, normal_tex, shadowmask_tex, atlas_size, atlas_slices, 1);
 			if (unlikely(error != BAKE_OK)) {
 				return error;
 			}

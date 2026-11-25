@@ -92,6 +92,7 @@ layout(set = 1, binding = 2) uniform texture2DArray direct_light;
 
 #ifdef MODE_PORTAL_SEAMS
 layout(set = 1, binding = 2) uniform texture2DArray source_position;
+layout(set = 1, binding = 3) uniform texture2DArray source_normal;
 #endif
 
 
@@ -1526,20 +1527,27 @@ void main() {
 #endif
 
 #ifdef MODE_PORTAL_SEAMS
-	// Texels just behind a portal's entrance, within its opening, take the values of the nearest
-	// texel in front of it on the same surface. A surface continuing through an opening is lit as
-	// two different places on either side of it; without this, filtering the lightmap at runtime
-	// would blend light from behind the portal into the edge in front of it. (Copying keeps the
-	// light up to the edge on the same footing as in front of it: lighting these texels as the
-	// place they continue into instead would mix real-time and baked light within the filter at
-	// the edge, for real-time lights.) params.ray_count is the number of layers per atlas slice
-	// (4 for SH lightmaps).
-	const int max_radius = 3;
+	// Texels just behind a portal's entrance, within its opening, copy a texel in front of it on the
+	// same surface. A surface continuing through an opening is lit as two different places on either
+	// side of it; without this, filtering the lightmap at runtime would blend light from behind the
+	// portal into the edge in front of it. The texel copied is found by stepping back to just in
+	// front of the portal's plane along the first directional light's direction projected onto the
+	// surface (along which its shadow edges run, so they continue straight through the plane), or
+	// straight back if there's no such light or it's nearly perpendicular to the surface or
+	// parallel to the plane. (Copying keeps the light up to the edge on the same footing as in
+	// front of it: lighting these texels as the place they continue into instead would mix real-time
+	// and baked light within the filter at the edge, for real-time lights.) params.ray_count is the
+	// number of layers per atlas slice (4 for SH lightmaps).
+	const int max_radius = 8;
+	const float max_step_texels = 6.0;
+	// How far behind the plane texels are filled (enough for the filter's reach).
+	const float seam_depth_texels = 3.0;
 	uint layers = params.ray_count;
 	ivec2 atlas_dims = textureSize(source_position, 0).xy;
 	vec4 position = texelFetch(sampler2DArray(source_position, linear_sampler), ivec3(atlas_pos, params.atlas_slice), 0);
+	vec3 normal = texelFetch(sampler2DArray(source_normal, linear_sampler), ivec3(atlas_pos, params.atlas_slice), 0).xyz;
 	ivec2 source_pos = atlas_pos;
-	if (position.w >= 0.001) {
+	if (position.w >= 0.001 && length(normal) >= 0.5) {
 		// World size of a texel (to its nearest used neighbor), to tell neighbors on the same
 		// surface from other charts nearby in the atlas.
 		float texel_size = 1e20;
@@ -1553,18 +1561,46 @@ void main() {
 				}
 			}
 		}
-		float max_distance = texel_size < 1e19 ? (float(max_radius) + 1.0) * 1.5 * texel_size : 0.0;
 
-		for (uint i = 0; i < bake_params.portal_count && source_pos == atlas_pos; i++) {
+		vec3 light_dir = vec3(0.0);
+		for (uint i = 0; i < bake_params.light_count; i++) {
+			if (lights.data[i].type == LIGHT_TYPE_DIRECTIONAL) {
+				light_dir = lights.data[i].direction;
+				break;
+			}
+		}
+		normal = normalize(normal);
+
+		for (uint i = 0; i < bake_params.portal_count && source_pos == atlas_pos && texel_size < 1e19; i++) {
 			Portal portal = portals.data[i];
 			float side = dot(position.xyz - portal.center, portal.front);
-			if (side >= 0.0) {
+			if (side >= 0.0 || side < -seam_depth_texels * texel_size) {
 				continue;
 			}
 			vec3 on_plane = position.xyz - portal.front * side - portal.center;
 			if (abs(dot(on_plane, portal.right)) > portal.half_width + PORTAL_EDGE_TOLERANCE || abs(dot(on_plane, portal.up)) > portal.half_height + PORTAL_EDGE_TOLERANCE) {
 				continue;
 			}
+
+			// Where to copy from: a point just in front of the plane, reached along the light's
+			// direction on the surface, or straight back.
+			float target_side = 0.5 * texel_size;
+			vec3 along = light_dir - normal * dot(light_dir, normal);
+			vec3 target;
+			if (length(along) > 0.1 && abs(dot(normalize(along), portal.front)) > 0.1) {
+				along = normalize(along);
+				along *= sign(dot(along, portal.front));
+				float distance_along = (target_side - side) / dot(along, portal.front);
+				target = distance_along <= max_step_texels * texel_size ? position.xyz + along * distance_along : vec3(1e20);
+			} else {
+				target = vec3(1e20);
+			}
+			if (target.x >= 1e19) {
+				vec3 back = portal.front - normal * dot(portal.front, normal);
+				target = length(back) > 0.1 ? position.xyz + normalize(back) * ((target_side - side) / dot(normalize(back), portal.front)) : position.xyz;
+			}
+
+			float max_distance = distance(target, position.xyz) + 2.0 * texel_size;
 			float best = 1e20;
 			for (int y = -max_radius; y <= max_radius; y++) {
 				for (int x = -max_radius; x <= max_radius; x++) {
@@ -1576,7 +1612,7 @@ void main() {
 					if (n.w < 0.001 || dot(n.xyz - portal.center, portal.front) < 0.0 || distance(n.xyz, position.xyz) > max_distance) {
 						continue;
 					}
-					float d = float(x * x + y * y);
+					float d = distance(n.xyz, target);
 					if (d < best) {
 						best = d;
 						source_pos = p;
